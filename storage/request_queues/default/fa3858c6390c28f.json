@@ -1,0 +1,16 @@
+{
+  "unique_key": "search:mining company Nigeria",
+  "url": "https://html.duckduckgo.com/html/?q=mining%20company%20Nigeria",
+  "method": "GET",
+  "payload": null,
+  "headers": {},
+  "user_data": {
+    "__crawlee": {
+      "state": 4
+    }
+  },
+  "retry_count": 0,
+  "no_retry": false,
+  "loaded_url": "https://html.duckduckgo.com/html/?q=mining%20company%20Nigeria",
+  "handled_at": "2026-09-02 07:37:53.798542+00:00"
+}
