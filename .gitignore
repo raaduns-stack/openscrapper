@@ -1,0 +1,14 @@
+# Local Python environment
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local runtime output
+output/*.csv
+output/*.xlsx
+
+# Local secrets/config
+.env
+.env.*
+!.env.example
