@@ -3,6 +3,7 @@ const AUTH_KEY='scrappeeAuth';
 const AUTO_KEY='serpAutoState';
 const API='https://api.scrapee.uk';
 const $=id=>document.getElementById(id);
+fetch(chrome.runtime.getURL("manifest.json")).then(r=>r.json()).then(m=>{const v=$("version");if(v)v.textContent=`v${m.version}`;}).catch(()=>{});
 
 async function getAuth(){const v=await chrome.storage.local.get(AUTH_KEY);if(v[AUTH_KEY]?.token)return v[AUTH_KEY];try{const r=await chrome.runtime.sendMessage({type:'auth_get'});if(r?.auth?.token){await chrome.storage.local.set({[AUTH_KEY]:r.auth});return r.auth;}}catch(_){}return null;}
 async function api(path,options={}){const auth=await getAuth();const headers={'Content-Type':'application/json',...(options.headers||{})};if(auth?.token)headers.Authorization=`Bearer ${auth.token}`;const r=await fetch(API+path,{...options,headers});const text=await r.text();let data={};try{data=text?JSON.parse(text):{}}catch(_){data={detail:text}}if(!r.ok)throw new Error(data.detail||`API error ${r.status}`);return data;}

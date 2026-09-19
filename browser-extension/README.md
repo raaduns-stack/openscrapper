@@ -1,4 +1,4 @@
-# Scrappee Browser Import v0.6.8
+# Scrappee Browser Import v0.6.9
 
 Automatic Google/Bing SERP collection built directly on the stable v0.6.7 extraction method.
 
