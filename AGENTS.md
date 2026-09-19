@@ -23,3 +23,13 @@
 - Scrappee Browser Extension behavior: `docs/SCRAPPEE-BROWSER-EXTENSION-SOURCE-OF-TRUTH.md`
 - This document is canonical for extension UX, authentication persistence, SERP capture, and Scrappee handoff.
 - Do not change the agreed extension workflow without explicit CTO approval and a corresponding source-of-truth update.
+## Git release control — mandatory CTO gate
+
+- All implementation commits are LOCAL commits on the current feature/development branch by default.
+- NEVER `git push`, merge, rebase into stable/main, or otherwise publish/promote changes to the remote repository without an explicit CTO command.
+- A local commit does NOT mean the change is stable, approved, tested, or released.
+- The CTO alone decides when a feature branch is ready to push and when it becomes stable.
+- Testing and validation happen before any requested push/merge; do not treat a local commit as approval.
+- Remote GitHub must be treated as release-controlled infrastructure, not as the default destination for commits.
+- If the CTO says to commit, commit locally only unless the same instruction explicitly requests a push.
+- If the CTO says to make it stable, do not push/merge unless the command explicitly authorizes the push/merge.
