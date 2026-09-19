@@ -330,14 +330,13 @@ class LeadDiscoveryPipeline:
             if at_match:
                 position = at_match.group(1).strip()
                 company_name = at_match.group(2).strip()
-            geography = str(criteria.geography or "").strip()
-            country = geography if geography else None
+            country = None
             city = None
-            location_match = _re.search(r"([A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'’.-]+(?:\s+[A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'’.-]+)*),\s*([A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'’.-]+(?:\s+[A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'’.-]+)*)", text)
+            location_match = _re.search(r"\b([A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'’.-]+(?:\s+[A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'’.-]+)*),\s*(England|Scotland|Wales|Northern Ireland|United Kingdom|UK|Spain|France|Germany|Italy|India|Canada|Australia|South Africa|United States|USA)\b", text, _re.I)
             if location_match:
                 city = location_match.group(1).strip()
-                detected_country = location_match.group(2).strip()
-                if not country or detected_country.lower() == country.lower(): country = detected_country
+                country = location_match.group(2).strip()
+                country = {"uk":"United Kingdom","usa":"United States"}.get(country.casefold(), country)
             if 2 <= len(name_words) <= 5 and (position or company_name) and not _re.search(r"\b(group|technology|healthcare|association|company|hospital|clinic|university|foundation|summit)\b", name_part, _re.I):
                 try:
                     payload={"first_name":name_words[0],"last_name":" ".join(name_words[1:]),"position":position,"company_name":company_name,"email":email_match.group(0) if email_match else None,"phone":phone_value,"city":city,"country":country,"source_url":url,"capture_stage":"serp"}
