@@ -43,29 +43,42 @@ def _persist_lead(scrap_id, lead: Lead, evidence_id=None) -> bool:
     if not scrap_id:
         return True
     import uuid as _uuid
+    import re as _re
     from src.db import db as _db
     from psycopg.types.json import Jsonb as _Jsonb
     data = lead.model_dump(mode="json")
+    sid = _uuid.UUID(str(scrap_id))
+    email = str(lead.email or "").strip().casefold()
+    first = _re.sub(r"[^a-z0-9]", "", (lead.first_name or "").casefold())
+    last = _re.sub(r"[^a-z0-9]", "", (lead.last_name or "").casefold())
+    company = _re.sub(r"[^a-z0-9]", "", (lead.company_name or "").casefold())
     with _db() as conn:
-        existing = conn.execute(
-            "SELECT id FROM leads WHERE scrap_id=%s AND lower(data->>'email')=lower(%s) LIMIT 1",
-            (_uuid.UUID(str(scrap_id)), str(lead.email)),
-        ).fetchone()
+        existing = None
+        if email:
+            existing = conn.execute("SELECT id,data FROM leads WHERE scrap_id=%s AND lower(data->>'email')=lower(%s) LIMIT 1", (sid, email)).fetchone()
+        if not existing and first and last and company:
+            existing = conn.execute("SELECT id,data FROM leads WHERE scrap_id=%s AND regexp_replace(lower(data->>'first_name'),'[^a-z0-9]','','g')=%s AND regexp_replace(lower(data->>'last_name'),'[^a-z0-9]','','g')=%s AND regexp_replace(lower(data->>'company_name'),'[^a-z0-9]','','g')=%s LIMIT 1", (sid, first, last, company)).fetchone()
+        if not existing and first and last:
+            existing = conn.execute("SELECT id,data FROM leads WHERE scrap_id=%s AND data->>'source_url'=%s AND regexp_replace(lower(data->>'first_name'),'[^a-z0-9]','','g')=%s AND regexp_replace(lower(data->>'last_name'),'[^a-z0-9]','','g')=%s LIMIT 1", (sid, str(lead.source_url), first, last)).fetchone()
         if existing:
+            existing_data = existing[1] or {}
+            merged = dict(existing_data)
+            for key, value in data.items():
+                if value not in (None, ""):
+                    merged[key] = value
+            old_stage = existing_data.get("capture_stage", "scrapy")
+            new_stage = data.get("capture_stage", "scrapy")
+            if old_stage != new_stage:
+                merged["capture_stage"] = "serp+scrapy"
+            conn.execute("UPDATE leads SET data=%s WHERE id=%s", (_Jsonb(merged), existing[0]))
             if evidence_id:
-                conn.execute(
-                    "INSERT INTO lead_sources(lead_id,evidence_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
-                    (existing[0], evidence_id),
-                )
+                conn.execute("INSERT INTO lead_sources(lead_id,evidence_id) VALUES(%s,%s) ON CONFLICT DO NOTHING", (existing[0], evidence_id))
             conn.commit()
             return False
         lead_id = _uuid.uuid4()
-        conn.execute("INSERT INTO leads(id,scrap_id,data) VALUES(%s,%s,%s)", (lead_id, _uuid.UUID(str(scrap_id)), _Jsonb(data)))
+        conn.execute("INSERT INTO leads(id,scrap_id,data) VALUES(%s,%s,%s)", (lead_id, sid, _Jsonb(data)))
         if evidence_id:
-            conn.execute(
-                "INSERT INTO lead_sources(lead_id,evidence_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
-                (lead_id, evidence_id),
-            )
+            conn.execute("INSERT INTO lead_sources(lead_id,evidence_id) VALUES(%s,%s) ON CONFLICT DO NOTHING", (lead_id, evidence_id))
         conn.commit()
     return True
 
@@ -89,6 +102,7 @@ class LeadDiscoveryPipeline:
             max_depth=self.crawler_config.max_crawl_depth,
         )
         self.extractor = AdaptiveLeadExtractor(model=model, generic_prefixes=generic_prefixes)
+        self.serp_extractor = AdaptiveLeadExtractor(model=model, generic_prefixes=generic_prefixes, allow_emailless=True)
         self.qualifier = LeadQualifier()
         self.evidence = EvidenceBuilder()
 
@@ -323,15 +337,20 @@ class LeadDiscoveryPipeline:
             _persist_evidence(scrap_id, evidence)
             emit_event(sink, "Evidence", f"SERP snippet evidence persisted {index}", evidence=index)
             try:
-                extracted = await self.extractor.extract(html, url, evidence=evidence)
+                extracted = await self.serp_extractor.extract(html, url, evidence=evidence)
             except Exception as exc:
                 extraction_failures += 1
                 emit_event(sink, "Extraction", f"Extraction failed for SERP evidence {index}: {type(exc).__name__}: {exc}", evidence=index, extracted=0, error_type=type(exc).__name__, error=str(exc)[:1000], extraction_failures=extraction_failures)
                 extracted = []
             qualified = [lead for lead in extracted if self.qualifier.qualify(lead, criteria).relevant]
             extracted_total += len(extracted); qualified_total += len(qualified)
+            persisted = 0
+            for lead in qualified:
+                if _persist_lead(scrap_id, lead, evidence_id=evidence_id):
+                    persisted += 1
+                    persisted_total += 1
             leads.extend(qualified)
-            emit_event(sink, "Leads", "SERP lead candidates processed", extracted=len(extracted), qualified=len(qualified), persisted=0, leads=len(leads), extracted_total=extracted_total, qualified_total=qualified_total, persisted_total=persisted_total)
+            emit_event(sink, "Leads", "SERP lead candidates processed", extracted=len(extracted), qualified=len(qualified), persisted=persisted, leads=len(leads), extracted_total=extracted_total, qualified_total=qualified_total, persisted_total=persisted_total)
             if should_stop_harvest():
                 break
 

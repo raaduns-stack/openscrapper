@@ -32,11 +32,31 @@ def dedupe(leads: list[Lead]) -> list[Lead]:
             ("email", email) if email else None,
             ("phone", phone) if phone else None,
             ("website", website) if website else None,
+            ("source_person", _normalize_website(str(lead.source_url)), first, last) if lead.source_url and (first or last) else None,
             ("person", first, last, company) if (first or last) and company else None,
             ("company_location", company, city, state) if company and city and state else None,
         }
         keys.discard(None)
-        if any(key in seen for key in keys): continue
+        match_index = next((i for i, existing in enumerate(result) if keys & {
+            ("email", _normalize_email(str(existing.email) if existing.email else None)) if existing.email else None,
+            ("phone", _normalize_phone(existing.phone)) if existing.phone else None,
+            ("website", _normalize_website(str(existing.website) if existing.website else None)) if existing.website else None,
+            ("source_person", _normalize_website(str(existing.source_url)), _normalize(existing.first_name), _normalize(existing.last_name)) if existing.source_url and (existing.first_name or existing.last_name) else None,
+            ("person", _normalize(existing.first_name), _normalize(existing.last_name), _normalize(existing.company_name)) if (existing.first_name or existing.last_name) and existing.company_name else None,
+        } - {None}), None)
+        if match_index is not None:
+            existing=result[match_index]
+            merged=existing.model_copy(update={
+                field: getattr(lead, field) if getattr(lead, field) is not None else getattr(existing, field)
+                for field in ("first_name","last_name","position","company_name","country","city","state","email","phone","website","source_url")
+            })
+            if existing.capture_stage != lead.capture_stage:
+                merged=merged.model_copy(update={"capture_stage":"serp+scrapy"})
+            result[match_index]=merged
+            seen.update(keys)
+            continue
+        if any(key in seen for key in keys):
+            continue
         result.append(lead)
         seen.update(keys)
     return result

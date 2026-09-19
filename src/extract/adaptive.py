@@ -27,9 +27,10 @@ class AdaptiveLeadExtractor:
 
     LLM_MAX_ATTEMPTS = 2
 
-    def __init__(self, model: str = "openai/gpt-oss-20b", generic_prefixes: set[str] | None = None):
+    def __init__(self, model: str = "openai/gpt-oss-20b", generic_prefixes: set[str] | None = None, allow_emailless: bool = False):
         self.model = model
         self.generic_prefixes = generic_prefixes
+        self.allow_emailless = allow_emailless
         self.agent = None
         self.evidence_builder = EvidenceBuilder()
         self.candidate_builder = CandidateBuilder()
@@ -51,12 +52,11 @@ class AdaptiveLeadExtractor:
                 retries=2,
                 system_prompt=(
                     "You extract individual business contacts. "
-                    "Every accepted lead must contain a valid personal email. "
-                    "A name is optional when no reliable name is available. "
-                    "Never invent missing values. "
-                    "Company, position, country, city, state, phone and "
-                    "website are enrichment fields. "
-                    "Preserve source_url exactly."
+                    + ("Every accepted lead must contain a valid personal email. " if not self.allow_emailless else "For SERP evidence, a lead may be accepted without email when a person name is present plus reliable company, position, location or phone evidence. ")
+                    + "A name is optional when no reliable name is available. "
+                    + "Never invent missing values. "
+                    + "Company, position, country, city, state, phone and website are enrichment fields. "
+                    + "Preserve source_url exactly."
                 ),
             )
 
@@ -128,7 +128,12 @@ class AdaptiveLeadExtractor:
                     website=data.get("website"),
                 )
                 if self.candidate_builder.is_valid_lead(candidate, self.generic_prefixes):
-                    leads.append(Lead.model_validate({k: v for k, v in candidate.__dict__.items() if k != "evidence" and v is not None}, context={"generic_prefixes": self.generic_prefixes}))
+                    payload={k: v for k, v in candidate.__dict__.items() if k != "evidence" and v is not None}
+                    leads.append(Lead.model_validate(payload, context={"generic_prefixes": self.generic_prefixes}))
+                elif self.allow_emailless and not candidate.email:
+                    payload={k: v for k, v in candidate.__dict__.items() if k != "evidence" and v is not None}
+                    payload["capture_stage"]="serp"
+                    leads.append(Lead.model_validate(payload, context={"generic_prefixes": self.generic_prefixes, "allow_serp_without_email": True}))
             except (ValidationError, TypeError, ValueError):
                 return
 
@@ -189,7 +194,7 @@ class AdaptiveLeadExtractor:
                 or person.css('[itemprop="email"]::attr(content)').get()
                 or person.css('[itemprop="email"]::text').get()
             )
-            if not full_name or not email:
+            if not full_name or (not email and not self.allow_emailless):
                 continue
             first_name, last_name = self._split_name(full_name)
             add_lead({
@@ -268,7 +273,7 @@ class AdaptiveLeadExtractor:
                     ).get()
                 )
 
-                if not full_name or not email:
+                if not full_name or (not email and not self.allow_emailless):
                     continue
 
                 first_name, last_name = self._split_name(full_name)
@@ -385,7 +390,7 @@ class AdaptiveLeadExtractor:
             "Extract INDIVIDUAL business contacts from this page.\n\n"
             f"EXACT SOURCE URL: {source_url}\n\n"
             "Acceptance rules:\n"
-            "1. Every returned lead MUST have a personal email.\n"
+            + (("1. Every returned lead MUST have a personal email.\n") if not self.allow_emailless else ("1. SERP leads may omit email when a person name plus reliable company, position, location or phone evidence is present.\n")) +
             "2. A name is optional; email-only leads are valid when no other reliable fields are available.\n"
             "3. Reject generic role mailboxes such as info@, contact@, sales@, support@, admin@ and similar.\n"
             "4. Prefer both first_name and last_name when explicitly present.\n"
@@ -428,7 +433,9 @@ class AdaptiveLeadExtractor:
             try:
                 data = raw if isinstance(raw, dict) else raw.model_dump()
                 data["source_url"] = source_url
-                leads.append(Lead.model_validate(data, context={"generic_prefixes": self.generic_prefixes}))
+                if self.allow_emailless:
+                    data["capture_stage"]="serp"
+                leads.append(Lead.model_validate(data, context={"generic_prefixes": self.generic_prefixes, "allow_serp_without_email": self.allow_emailless}))
             except ValidationError:
                 continue
 
