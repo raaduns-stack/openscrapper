@@ -11,17 +11,18 @@ class QualificationResult:
 
 class LeadQualifier:
     def qualify(self, lead: Lead, criteria: SearchCriteria) -> QualificationResult:
-        text = " ".join([
-            lead.business_name,
-            lead.city or "",
-            lead.state or "",
-            lead.phone or "",
+        text = " ".join(filter(None, [
+            lead.first_name,
+            lead.last_name,
+            lead.position,
+            lead.company_name,
+            lead.country,
+            lead.city,
+            lead.state,
+            lead.email,
+            lead.phone,
             str(lead.website or ""),
-            " ".join(
-                f"{contact.person_name} {contact.job_title or ''}"
-                for contact in lead.contacts
-            ),
-        ]).casefold()
+        ])).casefold()
 
         score = 0.0
         reasons: list[str] = []
@@ -31,44 +32,39 @@ class LeadQualifier:
                 score += 2.0
                 reasons.append(f"matched:{term}")
 
-        matched_term = any(
-            re.search(r"\b" + re.escape(term.casefold()) + r"\b", text)
-            for term in self._terms(criteria)
-        )
+        if criteria.geography and criteria.geography.casefold() in text:
+            score += 2.0
+            reasons.append(f"geography:{criteria.geography}")
 
-        if criteria.geography and matched_term:
-            geography = criteria.geography.casefold()
-            if geography in text:
+        for role in criteria.roles:
+            if role.casefold() in text:
                 score += 2.0
-                reasons.append(f"geography:{criteria.geography}")
+                reasons.append(f"role:{role}")
 
-        if criteria.roles:
-            for role in criteria.roles:
-                if role.casefold() in text:
-                    score += 2.0
-                    reasons.append(f"role:{role}")
-
-        if criteria.target_type in {"people", "both"} and lead.contacts:
+        # Source of truth: a verified personal email alone is sufficient to
+        # accept a Lead; semantic keyword matching is enrichment, not a gate.
+        if lead.email:
             score += 1.0
-            reasons.append("has_contact")
+            reasons.append("personal_email")
+            return QualificationResult(
+                relevant=True,
+                score=score,
+                reasons=tuple(reasons),
+            )
 
-        if lead.website:
-            score += 0.5
-            reasons.append("has_website")
-
+        has_semantic_match = any(
+            reason.startswith(("matched:", "role:"))
+            for reason in reasons
+        )
         return QualificationResult(
-            relevant=score >= 2.0,
+            relevant=has_semantic_match,
             score=score,
             reasons=tuple(reasons),
         )
 
     @staticmethod
     def _terms(criteria: SearchCriteria) -> list[str]:
-        values = [
-            criteria.industry,
-            criteria.product,
-            *criteria.keywords,
-        ]
+        values = [criteria.industry, criteria.product, *criteria.keywords]
         return list(dict.fromkeys(
             value.strip()
             for value in values

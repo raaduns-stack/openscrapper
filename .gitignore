@@ -12,3 +12,13 @@ output/*.xlsx
 .env
 .env.*
 !.env.example
+
+# Local/runtime scratch and generated archives
+storage/
+output/
+downloads/
+.desktop-commander/
+*.zip
+*.bak
+*.pre_seed_engineering
+.tmp_*

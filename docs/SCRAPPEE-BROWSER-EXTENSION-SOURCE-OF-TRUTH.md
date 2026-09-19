@@ -1,7 +1,7 @@
 # Scrappee Browser Extension — Source of Truth
 
 **Status:** APPROVED / CANONICAL
-**Version:** 0.6.1
+**Version:** 0.6.7
 **Date:** 2026-09-17
 
 ## Purpose
@@ -29,11 +29,17 @@ The extension workflow is intentionally simple and must not be redesigned withou
 - The extension has its own login form containing Email and Password.
 - Successful extension login creates a persistent server-side extension session.
 - The extension stores the authenticated session token in `chrome.storage.local`.
+- The service worker is the persistent authentication coordinator; popup opens recover authentication from the stored extension session instead of treating popup/page lifecycle changes as logout.
+- The popup must never block on authentication or display a user-facing “Checking authentication…” screen; local authentication state determines the initial UI immediately, while server validation runs in the background.
+- Authentication is validated against `/auth/me`; only an actual `401` invalid/expired session clears local authentication.
+- Popup startup must render from persisted `chrome.storage.local` authentication immediately; remote validation runs in the background and is bounded by a timeout so a slow/unreachable API cannot leave the popup stuck on **Checking authentication…**.
 - Google/Bing navigation, pagination, tab changes, scrolling, and opening the extension popup must not log the user out.
 - The normal Scrappee web application's short idle-session policy must not shorten an extension session.
 - The extension session remains valid until the user explicitly logs out or the server invalidates/revokes it.
 - **LOG OUT** must invalidate the server session and clear the extension's stored authentication state.
 - The extension must never require the user to re-enter credentials merely because a SERP page changed.
+- Extension-to-web authentication uses a separate persistent web session so reloading the Scrappee UI does not discard the web login state.
+- Extension logout clears the extension authentication state; it does not directly clear the separate web-session cookie.
 
 ## SERP capture — LOCKED
 
@@ -53,6 +59,7 @@ The extension workflow is intentionally simple and must not be redesigned withou
 - Sync is an explicit user action: **SYNC TO CURRENT SCRAP**.
 - Sync must not require the user to switch to the Scrappee web UI first.
 - Sync must preserve the captured result data and associate it with the authenticated user's current Scrap.
+- Sync is idempotent for already-synchronized captured occurrences; repeated Sync must not create duplicate SERP rows.
 
 ## UI — LOCKED
 

@@ -1,6 +1,22 @@
 from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
+
+class CrawlerConfig(BaseModel):
+    """User-configurable search and crawling safety limits."""
+
+    max_queries: int = Field(default=20, ge=1, le=500)
+    provider_failure_limit: int = Field(default=2, ge=1, le=20)
+    url_validity_checks: bool = True
+    max_crawl_pages: int | None = Field(default=None, ge=1, le=10000)
+    max_crawl_urls: int | None = Field(default=None, ge=1, le=100000)
+    max_crawl_depth: int | None = Field(default=None, ge=0, le=100)
+    max_pagination_pages: int | None = Field(default=None, ge=1, le=1000)
+    max_duration_hours: int = Field(default=48, ge=1, le=720)
+    duplicate_exhaustion_enabled: bool = True
+    duplicate_exhaustion_threshold: int = Field(default=3, ge=1, le=100)
+
+
 class SearchCriteria(BaseModel):
     industry: str = Field(min_length=1)
     product: str | None = None

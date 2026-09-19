@@ -22,6 +22,18 @@ class QueryExpander:
         "associations", "members", "exhibitors",
     ]
 
+    CONTACT_TERMS = [
+        "contact", "contact us", "email", "phone",
+        "staff", "team", "procurement", "purchasing",
+        "sales", "directory", "members", "exhibitors",
+    ]
+
+    EMAIL_SEARCH_PATTERNS = [
+        '"@"',
+        'email',
+        '"email address"',
+    ]
+
     def __init__(self, geography: GeographyResolver | None = None):
         self.geography = geography or GeographyResolver()
 
@@ -66,27 +78,64 @@ class QueryExpander:
         else:
             intent_terms = self.COMPANY_TERMS + self.INTENT_TERMS
 
-        # Stage 1: commercial discovery intent first.
-        for term in [*custom_terms, *intent_terms]:
-            if criteria.geography:
-                add(industry, term, criteria.geography)
-            else:
-                add(industry, term)
+        location = criteria.geography or ""
+        relevance_terms = [*custom_terms, *intent_terms]
+        contact_anchors = list(criteria.roles) or (
+            self.PEOPLE_TERMS[:6] if criteria.target_type in ("people", "both") else self.COMPANY_TERMS[:6]
+        )
+        # Interleave topical and contact-bearing intent so crawl-page limits do not
+        # consume the budget before contact-oriented results are reached.
+        relevance_index = 0
+        contact_index = 0
+        while len(queries) < max_queries and (
+            relevance_index < len(relevance_terms) or contact_index < len(self.CONTACT_TERMS)
+        ):
+            if relevance_index < len(relevance_terms):
+                term = relevance_terms[relevance_index]
+                relevance_index += 1
+                add(industry, product if product != industry else "", term, location)
+                if len(queries) >= max_queries:
+                    return queries
 
-            if len(queries) >= max_queries:
-                return queries
+            if contact_index < len(self.CONTACT_TERMS):
+                contact_term = self.CONTACT_TERMS[contact_index]
+                contact_anchor = contact_anchors[contact_index % len(contact_anchors)]
+                contact_index += 1
+                add(
+                    industry,
+                    product if product != industry else "",
+                    contact_anchor,
+                    contact_term,
+                    location,
+                )
 
-        # Stage 2: broad fallback queries.
-        add(industry)
+                # Search-engine queries must actively surface contact-bearing sources.
+                # "@" is an evidence marker, not a provider/domain allowlist: this
+                # intentionally covers personal mailboxes on public and company domains.
+                if len(queries) < max_queries:
+                    email_pattern = self.EMAIL_SEARCH_PATTERNS[(contact_index - 1) % len(self.EMAIL_SEARCH_PATTERNS)]
+                    add(
+                        industry,
+                        product if product != industry else "",
+                        contact_anchor,
+                        email_pattern,
+                        location,
+                    )
+
+                if len(queries) < max_queries and criteria.target_type in ("people", "both"):
+                    add(
+                        "site:linkedin.com",
+                        contact_anchor,
+                        '"@"',
+                        location,
+                    )
+
+        # Stage 3: broad fallback queries if the budget still has room.
+        add(industry, location)
         if product != industry:
-            add(product)
+            add(product, location)
 
-        if criteria.geography:
-            add(industry, criteria.geography)
-            if product != industry:
-                add(product, criteria.geography)
-
-        # Stage 3: geographic expansion only after broad queries.
+        # Stage 4: geographic expansion only after relevance + contact intent.
         if criteria.geography and len(queries) < max_queries:
             geo = self.geography.resolve(criteria.geography)
 

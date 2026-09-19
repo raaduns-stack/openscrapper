@@ -1,11 +1,17 @@
 import json
+import os
 import subprocess
 import time
 
 
 class OpenClawBrowser:
-    def __init__(self, cli: str = "openclaw"):
+    DEFAULT_TIMEOUT = 30.0
+
+    def __init__(self, cli: str = "openclaw", timeout: float | None = None):
         self.cli = cli if cli != "openclaw" else "/root/.openclaw/bin/openclaw"
+        self.timeout = timeout if timeout is not None else float(os.getenv("OPENCLAW_BROWSER_TIMEOUT", self.DEFAULT_TIMEOUT))
+        if self.timeout <= 0:
+            raise ValueError("OpenClaw browser timeout must be positive")
 
     def _run(self, *args: str) -> str:
         last_error = None
@@ -16,8 +22,11 @@ class OpenClawBrowser:
                     capture_output=True,
                     text=True,
                     check=True,
+                    timeout=self.timeout,
                 )
                 return result.stdout.strip()
+            except subprocess.TimeoutExpired as e:
+                raise RuntimeError(f"OpenClaw browser command timed out after {self.timeout:g}s: {' '.join(args)}") from e
             except subprocess.CalledProcessError as e:
                 detail = (e.stderr or e.stdout or "").strip()
                 last_error = RuntimeError(

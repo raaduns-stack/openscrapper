@@ -1,0 +1,56 @@
+const KEY='harvestedResults';
+const AUTH_KEY='scrappeeAuth';
+const API='https://api.scrapee.uk';
+const WEB_AUTH_KEY='scrappeeWebAuth';
+const WEB_COOKIE='scrappee_web_session';
+
+async function readResults(){const v=await chrome.storage.local.get(KEY);return Array.isArray(v[KEY])?v[KEY]:[];}
+async function badge(){const r=await readResults();await chrome.action.setBadgeText({text:r.length?String(Math.min(r.length,9999)):''});}
+async function readAuth(){const v=await chrome.storage.local.get(AUTH_KEY);return v[AUTH_KEY]||null;}
+async function writeAuth(auth){await chrome.storage.local.set({[AUTH_KEY]:auth});return auth;}
+async function clearAuth(){await chrome.storage.local.remove(AUTH_KEY);}
+async function ensureWebSession(auth){
+ if(!auth?.token)return;
+ try{
+  const v=await chrome.storage.local.get(WEB_AUTH_KEY);
+  let web=v[WEB_AUTH_KEY];
+  if(!web?.token){const r=await fetch(`${API}/auth/web-session`,{method:'POST',headers:{Authorization:`Bearer ${auth.token}`}});if(!r.ok)return;web=await r.json();await chrome.storage.local.set({[WEB_AUTH_KEY]:web});}
+  await chrome.cookies.set({url:'https://scrapee.uk/',name:WEB_COOKIE,value:web.token,domain:'scrapee.uk',path:'/',secure:true,httpOnly:true,sameSite:'lax',expirationDate:Math.floor(Date.now()/1000)+31536000});
+ }catch(_){}
+}
+async function validateAuth(){
+ const auth=await readAuth();
+ if(!auth?.token)return {ok:false,reason:'missing'};
+ try{
+  const r=await fetch(`${API}/auth/me`,{headers:{Authorization:`Bearer ${auth.token}`}});
+  if(r.ok){const data=await r.json();if(data?.email&&!auth.email)await writeAuth({...auth,email:data.email});await ensureWebSession(auth);return {ok:true,auth};}
+  if(r.status===401){await clearAuth();return {ok:false,reason:'unauthorized'};}
+  return {ok:true,auth};
+ }catch(_){return {ok:true,auth};}
+}
+
+chrome.runtime.onInstalled.addListener(badge);
+chrome.runtime.onStartup.addListener(badge);
+
+chrome.runtime.onMessage.addListener((message,sender,sendResponse)=>{
+ if(message?.type==='auth_get'){
+  (async()=>sendResponse({ok:true,auth:await readAuth()}))().catch(e=>sendResponse({ok:false,error:String(e)}));
+  return true;
+ }
+ if(message?.type==='auth_set'){
+  (async()=>{const auth=await writeAuth(message.auth);await ensureWebSession(auth);sendResponse({ok:true,auth});})().catch(e=>sendResponse({ok:false,error:String(e)}));
+  return true;
+ }
+ if(message?.type==='auth_clear'){
+  (async()=>{await clearAuth();sendResponse({ok:true});})().catch(e=>sendResponse({ok:false,error:String(e)}));
+  return true;
+ }
+ if(message?.type==='auth_validate'){
+  (async()=>sendResponse(await validateAuth()))().catch(e=>sendResponse({ok:false,error:String(e)}));
+  return true;
+ }
+ if(message?.type==='serp_results'){
+  (async()=>{const current=await readResults(),incoming=Array.isArray(message.results)?message.results:[],tagged=incoming.map((x,i)=>({...x,capture_id:`${Date.now()}-${sender.tab?.id||0}-${i}`,captured_at:new Date().toISOString()})),next=current.concat(tagged).slice(-10000);await chrome.storage.local.set({[KEY]:next});await badge();sendResponse({ok:true,count:next.length,added:tagged.length});})().catch(e=>sendResponse({ok:false,error:String(e)}));
+  return true;
+ }
+});

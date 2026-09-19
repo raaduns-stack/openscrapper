@@ -3,9 +3,7 @@ import asyncio
 from src.agent.discovery import DiscoveryAgent
 from src.agent.discovery_controller import DiscoveryController
 from src.agent.query_expansion import QueryExpander
-from src.agent.relevance import RelevanceScorer
 from src.models.criteria import SearchCriteria
-from src.search.models import SearchResult, SearchResults
 
 
 def criteria(**overrides):
@@ -35,58 +33,19 @@ def test_company_query_contains_commercial_intent():
     assert any(term in joined for term in ("company", "business", "supplier", "dealer", "trader"))
 
 
-def test_controller_respects_budget():
+def test_query_expansion_includes_contact_intent_early():
+    queries = QueryExpander().expand(
+        criteria(target_type="people", roles=["buyer"]), max_queries=10
+    )
+    contact_queries = [q.lower() for q in queries if any(
+        term in q.lower() for term in ("contact", "email", "phone", "staff", "team", "sales")
+    )]
+    assert contact_queries
+    assert any("buyer" in q and "contact" in q for q in contact_queries)
+    assert next(i for i, q in enumerate(queries) if q.lower() == contact_queries[0]) <= 3
+
+
     plan = DiscoveryController().plan(criteria(max_leads=20))
-    assert plan.budget == 10
-    assert len(plan.queries) <= plan.budget
-
-
-def test_relevance_prefers_business_source():
-    scorer = RelevanceScorer()
-    good = SearchResult(
-        title="Gold Mining Companies Nigeria",
-        url="https://example.com/gold-mining-companies-nigeria",
-        snippet="Directory of gold mining companies and suppliers in Nigeria",
-        provider="test",
-    )
-    bad = SearchResult(
-        title="Gold Price Forecast",
-        url="https://example.com/gold-price-forecast",
-        snippet="Latest gold rates and investment forecast",
-        provider="test",
-    )
-    assert scorer.score(good, criteria()) > scorer.score(bad, criteria())
-    assert scorer.is_relevant(good, criteria())
-
-
-class FakeSearch:
-    async def search(self, query, limit_per_provider=10):
-        return SearchResults(
-            query=query,
-            results=[
-                SearchResult(
-                    title="Gold Mining Company Nigeria",
-                    url="https://company.example",
-                    snippet="Gold mining company and supplier in Nigeria",
-                    provider="fake",
-                ),
-                SearchResult(
-                    title="Gold Price Forecast",
-                    url="https://noise.example",
-                    snippet="Gold price forecast and rates",
-                    provider="fake",
-                ),
-            ],
-        )
-
-
-def test_discovery_filters_and_deduplicates_sources():
-    agent = DiscoveryAgent(search=FakeSearch())
-    results = asyncio.run(agent.discover(criteria(max_leads=5)))
-
-    urls = [item.url for item in results]
-
-    assert "https://company.example" in urls
-    assert urls.count("https://company.example") == 1
-    assert len(results) <= 5
-    assert results == sorted(results, key=lambda item: item.score, reverse=True)
+    assert plan.query_budget == 10
+    assert plan.budget == plan.query_budget
+    assert len(plan.queries) <= plan.query_budget

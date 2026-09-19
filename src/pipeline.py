@@ -1,61 +1,512 @@
+import asyncio
+
 from src.agent.discovery import DiscoveryAgent
-from src.browser.openclaw import OpenClawBrowser
-from src.browser.paginator import Paginator
-from src.dedupe.leads import dedupe
 from src.agent.qualification import LeadQualifier
+from src.collector.scrapy_runner import ScrapyCollector
+from src.dedupe.leads import dedupe
 from src.extract.adaptive import AdaptiveLeadExtractor
-from src.models.criteria import SearchCriteria
-from src.models.lead import Lead
+from src.extract.evidence import EvidenceBuilder
+from src.extract.documents import is_document_url, extract_document_text
+from html import escape
+from urllib.parse import urlparse
+import time
 from src.exports.csv_export import export_csv
+from src.exports.google_sheets import export_google_sheets
 from src.exports.xlsx_export import export_xlsx
+from src.models.criteria import CrawlerConfig, SearchCriteria
+from src.models.lead import Lead
+from src.policy import domain_matches
+from src.observability.job_events import JobEvent, emit_event, NullJobEventSink
+
+
+def _persist_evidence(scrap_id, evidence):
+    if not scrap_id: return None
+    import uuid as _uuid
+    from src.db import db as _db
+    from psycopg.types.json import Jsonb as _Jsonb
+    evidence_id=_uuid.uuid4()
+    with _db() as conn:
+        conn.execute("INSERT INTO evidence(id,scrap_id,source_type,source_id,data) VALUES(%s,%s,%s,%s,%s)",(evidence_id,_uuid.UUID(str(scrap_id)),evidence.source,None,_Jsonb(evidence.model_dump(mode="json"))))
+        conn.commit()
+    return evidence_id
+
+
+def _domain_allowed(url: str, rules: list[tuple[str, str]]) -> bool:
+    host = urlparse(url).hostname or ""
+    if any(rule_type == "blacklist" and domain_matches(host, domain) for domain, rule_type in rules):
+        return False
+    whitelists = [domain for domain, rule_type in rules if rule_type == "whitelist"]
+    return not whitelists or any(domain_matches(host, domain) for domain in whitelists)
+
+
+def _persist_lead(scrap_id, lead: Lead, evidence_id=None) -> bool:
+    if not scrap_id:
+        return True
+    import uuid as _uuid
+    from src.db import db as _db
+    from psycopg.types.json import Jsonb as _Jsonb
+    data = lead.model_dump(mode="json")
+    with _db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM leads WHERE scrap_id=%s AND lower(data->>'email')=lower(%s) LIMIT 1",
+            (_uuid.UUID(str(scrap_id)), str(lead.email)),
+        ).fetchone()
+        if existing:
+            if evidence_id:
+                conn.execute(
+                    "INSERT INTO lead_sources(lead_id,evidence_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                    (existing[0], evidence_id),
+                )
+            conn.commit()
+            return False
+        lead_id = _uuid.uuid4()
+        conn.execute("INSERT INTO leads(id,scrap_id,data) VALUES(%s,%s,%s)", (lead_id, _uuid.UUID(str(scrap_id)), _Jsonb(data)))
+        if evidence_id:
+            conn.execute(
+                "INSERT INTO lead_sources(lead_id,evidence_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                (lead_id, evidence_id),
+            )
+        conn.commit()
+    return True
 
 
 class LeadDiscoveryPipeline:
-    def __init__(self, model: str = "openai/gpt-oss-20b", max_pages: int = 25):
-        self.discovery = DiscoveryAgent()
-        self.browser = OpenClawBrowser()
-        self.paginator = Paginator(self.browser, max_pages=max_pages)
-        self.extractor = AdaptiveLeadExtractor(model=model)
+    def __init__(
+        self,
+        model: str = "openai/gpt-oss-20b",
+        max_pages: int = 25,
+        crawler_config: CrawlerConfig | None = None,
+        generic_prefixes: set[str] | None = None,
+        domain_rules: list[tuple[str, str]] | None = None,
+    ):
+        self.crawler_config = crawler_config or CrawlerConfig(max_crawl_pages=max_pages)
+        self.generic_prefixes = generic_prefixes
+        self.domain_rules = domain_rules or []
+        self.discovery = DiscoveryAgent(config=self.crawler_config)
+        self.collector = ScrapyCollector(
+            max_pages=self.crawler_config.max_crawl_pages,
+            max_urls=self.crawler_config.max_crawl_urls,
+            max_depth=self.crawler_config.max_crawl_depth,
+        )
+        self.extractor = AdaptiveLeadExtractor(model=model, generic_prefixes=generic_prefixes)
         self.qualifier = LeadQualifier()
+        self.evidence = EvidenceBuilder()
 
-    async def run(self, criteria: SearchCriteria) -> list[Lead]:
-        candidates = await self.discovery.discover(criteria)
+    async def run(self, criteria: SearchCriteria, event_sink=None, scrap_id=None, cancel_check=None) -> list[Lead]:
+        sink = event_sink or NullJobEventSink()
+        started_at = time.monotonic()
+        emit_event(sink, "Discovery", "Starting discovery")
+        candidates = await self.discovery.discover(criteria, event_sink=sink)
+        sink.emit(JobEvent(stage="URLs", state="complete", message=f"Captured {len(candidates)} candidate URLs from search", counts={"urls_captured": len(candidates)}, items=[{"url": c.url, "query": c.query} for c in candidates[:250]]))
+        emit_event(sink, "Collection", "Collecting candidate sources", urls_total=len(candidates))
         leads: list[Lead] = []
+        timeout_seconds = self.crawler_config.max_duration_hours * 3600
+        stop_reason = None
+        persisted_total = 0
+        if scrap_id:
+            import uuid as _uuid
+            from src.db import db as _db
+            with _db() as conn:
+                persisted_total = int(conn.execute("SELECT count(*) FROM leads WHERE scrap_id=%s", (_uuid.UUID(str(scrap_id)),)).fetchone()[0])
 
-        for candidate in candidates:
+        def should_stop():
+            nonlocal stop_reason
+            if cancel_check and cancel_check():
+                stop_reason = "canceled"
+                return True
+            if persisted_total >= criteria.max_leads:
+                stop_reason = "lead_limit"
+                return True
+            if time.monotonic() - started_at >= timeout_seconds:
+                stop_reason = "time_limit"
+                return True
+            return False
+
+        def scrapy_progress(event):
+            state = event.get("state", "running")
+            message = event.get("message", "Scrapy progress")
+            url = event.get("url")
+            if url:
+                message = f"{message}: {url}"
+            emit_event(
+                sink,
+                "Collection",
+                message,
+                state=state,
+                urls_submitted=int(event.get("urls_submitted", len(candidates))),
+                pages_collected=int(event.get("pages_collected", 0)),
+                pages_failed=int(event.get("pages_failed", 0)),
+            )
+
+        page_queue: asyncio.Queue[CollectedPage | None] = asyncio.Queue(maxsize=16)
+        loop = asyncio.get_running_loop()
+
+        def page_callback(page):
+            future = asyncio.run_coroutine_threadsafe(page_queue.put(page), loop)
+            future.result()
+
+        async def collect_stream():
             try:
-                pages = self.paginator.collect(candidate.url)
+                return await self.collector.collect_async(
+                    (candidate.url for candidate in candidates),
+                    progress_callback=scrapy_progress,
+                    scrap_id=scrap_id,
+                    page_callback=page_callback,
+                    cancel_check=should_stop,
+                )
+            finally:
+                await page_queue.put(None)
 
-                for page_url, html in pages:
-                    extracted = await self.extractor.extract(
-                        html,
-                        page_url,
-                    )
-                    leads.extend(
-                        lead for lead in extracted
-                        if self.qualifier.qualify(lead, criteria).relevant
-                    )
+        collector_task = asyncio.create_task(collect_stream())
+        emit_event(sink, "Extraction", "Processing pages incrementally")
 
-                    if len(leads) >= criteria.max_leads:
-                        break
-
-            except Exception as exc:
-                print(f"skip={candidate.url} error={exc}")
+        page_index = 0
+        extracted_total = qualified_total = persisted_total = 0
+        cancelled = False
+        while True:
+            if should_stop():
+                break
+            page = await page_queue.get()
+            if page is None:
+                break
+            page_index += 1
+            if cancel_check and cancel_check():
+                cancelled = True
+                emit_event(sink, "Collection", "Job cancellation requested", state="canceled")
+            if cancelled:
+                continue
+            if page.status >= 400 or not _domain_allowed(page.url, self.domain_rules):
                 continue
 
-            if len(leads) >= criteria.max_leads:
+            if is_document_url(page.url, page.content_type):
+                try:
+                    document_text = extract_document_text(page.body, page.url, page.content_type)
+                except Exception as exc:
+                    print(f"document_extraction_error={page.url}: {exc}")
+                    continue
+                if not document_text.strip():
+                    continue
+                html = f"<html><body><pre>{escape(document_text)}</pre></body></html>"
+                page_text = document_text
+            else:
+                if not page.html.strip():
+                    continue
+                html = page.html
+                page_text = page.text
+
+            evidence = self.evidence.build(
+                url=page.url,
+                html=html,
+                text=page_text,
+                status=page.status,
+                rendered=False,
+                source=page.source,
+            )
+            evidence_id = _persist_evidence(scrap_id, evidence)
+            emit_event(sink, "Evidence", f"Evidence persisted for page {page_index}", page=page_index, evidence=page_index)
+
+            extracted = await self.extractor.extract(
+                html,
+                page.url,
+                evidence=evidence,
+            )
+            emit_event(sink, "Validation", f"Validated page {page_index}", page=page_index, extracted=len(extracted))
+
+            qualified = [
+                lead
+                for lead in extracted
+                if self.qualifier.qualify(lead, criteria).relevant
+            ]
+            extracted_total += len(extracted)
+            qualified_total += len(qualified)
+            persisted = 0
+            for lead in qualified:
+                if _persist_lead(scrap_id, lead, evidence_id=evidence_id):
+                    persisted += 1
+                    persisted_total += 1
+                leads.append(lead)
+            persisted_total += persisted
+            emit_event(sink, "Leads", "Lead candidates processed", extracted=len(extracted), qualified=len(qualified), persisted=persisted, leads=len(leads), extracted_total=extracted_total, qualified_total=qualified_total, persisted_total=persisted_total)
+            if should_stop():
                 break
 
-        return dedupe(leads)[:criteria.max_leads]
+        try:
+            crawl_result = await collector_task
+        except RuntimeError:
+            if stop_reason != "canceled":
+                crawl_result = []
+            else:
+                raise
+        if stop_reason == "lead_limit":
+            emit_event(sink, "Collection", f"Lead target reached ({criteria.max_leads}); stopping crawl", state="completed", stop_reason=stop_reason, leads=persisted_total)
+        elif stop_reason == "time_limit":
+            emit_event(sink, "Collection", f"Research timeout reached ({self.crawler_config.max_duration_hours} hours); stopping crawl", state="completed", stop_reason=stop_reason, leads=persisted_total)
+        elif stop_reason == "canceled":
+            emit_event(sink, "Collection", "Job cancellation requested", state="canceled", stop_reason=stop_reason)
+        else:
+            emit_event(sink, "Collection", "Collection complete", pages_collected=len(crawl_result), urls_total=len(candidates))
+
+        final = dedupe(leads)[:criteria.max_leads]
+        emit_event(sink, "Qualification/Deduplication", "Qualification and deduplication complete", input_leads=len(leads), leads=len(final))
+        emit_event(sink, "Leads", "Lead set ready", state="complete", leads=len(final))
+        return final
+
+    async def _stream_pages(self, urls, *, progress_callback=None, scrap_id=None, cancel_check=None):
+        page_queue: asyncio.Queue[CollectedPage | None] = asyncio.Queue(maxsize=16)
+        loop = asyncio.get_running_loop()
+
+        def page_callback(page):
+            future = asyncio.run_coroutine_threadsafe(page_queue.put(page), loop)
+            future.result()
+
+        async def collect_stream():
+            try:
+                return await self.collector.collect_async(
+                    urls,
+                    progress_callback=progress_callback,
+                    scrap_id=scrap_id,
+                    page_callback=page_callback,
+                    cancel_check=cancel_check,
+                )
+            finally:
+                await page_queue.put(None)
+
+        collector_task = asyncio.create_task(collect_stream())
+        while True:
+            page = await page_queue.get()
+            if page is None:
+                break
+            yield page
+        await collector_task
+
+    async def run_harvested(self, criteria: SearchCriteria, results, event_sink=None, scrap_id=None, cancel_check=None) -> list[Lead]:
+        """Process SERP result occurrences, including snippets as first-class evidence."""
+        sink = event_sink or NullJobEventSink()
+        records = [r if isinstance(r, dict) else r.model_dump() for r in results]
+        urls = [r.get("url", "") for r in records if r.get("url")]
+        emit_event(sink, "URLs", "Imported SERP result occurrences", urls_total=len(urls), snippets=sum(bool(r.get("snippet", "").strip()) for r in records))
+        leads: list[Lead] = []
+        extracted_total = qualified_total = persisted_total = extraction_failures = 0
+        started_at = time.monotonic()
+        timeout_seconds = self.crawler_config.max_duration_hours * 3600
+        stop_reason = None
+
+        def should_stop_harvest():
+            nonlocal stop_reason
+            if cancel_check and cancel_check():
+                stop_reason = "canceled"
+                return True
+            if len(dedupe(leads)) >= criteria.max_leads:
+                stop_reason = "lead_limit"
+                return True
+            if time.monotonic() - started_at >= timeout_seconds:
+                stop_reason = "time_limit"
+                return True
+            return False
+
+        # Snippets are evidence, not just display metadata. Process them even when
+        # the destination page later fails, so contact details visible in the SERP
+        # are not discarded.
+        for index, record in enumerate(records, start=1):
+            if should_stop_harvest():
+                break
+            snippet = str(record.get("snippet", "")).strip()
+            if not snippet:
+                continue
+            url = record.get("url")
+            if not url:
+                continue
+            title = str(record.get("title", "")).strip()
+            snippet_text = f"{title}\n{snippet}".strip()
+            html = f"<html><body><h1>{escape(title)}</h1><p>{escape(snippet)}</p></body></html>"
+            evidence = self.evidence.build(url=url, html=html, text=snippet_text, status=200, rendered=True, source="serp-snippet")
+            _persist_evidence(scrap_id, evidence)
+            emit_event(sink, "Evidence", f"SERP snippet evidence persisted {index}", evidence=index)
+            try:
+                extracted = await self.extractor.extract(html, url, evidence=evidence)
+            except Exception as exc:
+                extraction_failures += 1
+                emit_event(sink, "Extraction", f"Extraction failed for SERP evidence {index}: {type(exc).__name__}: {exc}", evidence=index, extracted=0, error_type=type(exc).__name__, error=str(exc)[:1000], extraction_failures=extraction_failures)
+                extracted = []
+            qualified = [lead for lead in extracted if self.qualifier.qualify(lead, criteria).relevant]
+            extracted_total += len(extracted); qualified_total += len(qualified)
+            leads.extend(qualified)
+            emit_event(sink, "Leads", "SERP lead candidates processed", extracted=len(extracted), qualified=len(qualified), persisted=0, leads=len(leads), extracted_total=extracted_total, qualified_total=qualified_total, persisted_total=persisted_total)
+            if should_stop_harvest():
+                break
+
+        if urls:
+            progress_callback = lambda event: emit_event(
+                sink,
+                "Collection",
+                event.get("message", "Scrapy progress"),
+                state=event.get("state", "running"),
+                urls_submitted=int(event.get("urls_submitted", len(urls))),
+                pages_collected=int(event.get("pages_collected", 0)),
+                pages_failed=int(event.get("pages_failed", 0)),
+            )
+            snippet_queues: dict[str, list[str]] = {}
+            for record in records:
+                if record.get("url") and record.get("snippet"):
+                    snippet_queues.setdefault(record["url"], []).append(str(record["snippet"]))
+            page_index = 0
+            cancelled = False
+            try:
+                async for page in self._stream_pages(urls, progress_callback=progress_callback, scrap_id=scrap_id, cancel_check=should_stop_harvest):
+                    page_index += 1
+                    if should_stop_harvest():
+                        cancelled = stop_reason == "canceled"
+                        if stop_reason != "canceled":
+                            break
+                        emit_event(sink, "Collection", "Job cancellation requested", state="canceled")
+                    if cancelled or page.error or page.status >= 400 or page.status == 0:
+                        continue
+                    if is_document_url(page.url, page.content_type):
+                        try:
+                            document_text = extract_document_text(page.body, page.url, page.content_type)
+                        except Exception:
+                            continue
+                        if not document_text.strip():
+                            continue
+                        html = f"<html><body><pre>{escape(document_text)}</pre></body></html>"
+                        page_text = document_text
+                    else:
+                        if not page.html.strip():
+                            continue
+                        html = page.html
+                        page_text = page.text
+                    snippets = snippet_queues.get(page.url, [])
+                    if snippets:
+                        page_text = ("\n\nSERP SNIPPET EVIDENCE:\n" + "\n\n".join(snippets) + "\n\n" + page_text).strip()
+                    evidence = self.evidence.build(url=page.url, html=html, text=page_text, status=page.status, rendered=False, source=page.source)
+                    evidence_id = _persist_evidence(scrap_id, evidence)
+                    emit_event(sink, "Evidence", f"Evidence persisted for page {page_index}", page=page_index, evidence=page_index)
+                    try:
+                        extracted = await self.extractor.extract(html, page.url, evidence=evidence)
+                    except Exception as exc:
+                        extraction_failures += 1
+                        emit_event(sink, "Extraction", f"Extraction failed for page {page_index}: {type(exc).__name__}: {exc}", page=page_index, extracted=0, error_type=type(exc).__name__, error=str(exc)[:1000], extraction_failures=extraction_failures)
+                        extracted = []
+                    qualified = [lead for lead in extracted if self.qualifier.qualify(lead, criteria).relevant]
+                    extracted_total += len(extracted); qualified_total += len(qualified)
+                    persisted = 0
+                    for lead in qualified:
+                        if _persist_lead(scrap_id, lead, evidence_id=evidence_id):
+                            persisted += 1
+                    persisted_total += persisted
+                    leads.extend(qualified)
+                    emit_event(sink, "Validation", f"Validated page {page_index}", page=page_index, extracted=len(extracted))
+                    emit_event(sink, "Leads", "Lead candidates processed", extracted=len(extracted), qualified=len(qualified), persisted=persisted, leads=len(leads), extracted_total=extracted_total, qualified_total=qualified_total, persisted_total=persisted_total)
+            except Exception as exc:
+                emit_event(sink, "Collection", "Collection failed", state="failed", urls_total=len(urls))
+                print(f"collection_error={exc}")
+                raise
+            if stop_reason == "lead_limit":
+                emit_event(sink, "Collection", f"Lead target reached ({criteria.max_leads}); stopping crawl", state="completed", stop_reason=stop_reason)
+            elif stop_reason == "time_limit":
+                emit_event(sink, "Collection", f"Research timeout reached ({self.crawler_config.max_duration_hours} hours); stopping crawl", state="completed", stop_reason=stop_reason)
+            elif stop_reason == "canceled":
+                emit_event(sink, "Collection", "Job cancellation requested", state="canceled", stop_reason=stop_reason)
+            else:
+                emit_event(sink, "Collection", "Collection complete", pages_collected=page_index, urls_total=len(urls))
+
+        final = dedupe(leads)[:criteria.max_leads]
+        emit_event(sink, "Qualification/Deduplication", "Qualification and deduplication complete", input_leads=len(leads), leads=len(final))
+        emit_event(sink, "Leads", "Lead set ready", state="complete", leads=len(final))
+        return final
+
+    async def run_urls(self, criteria: SearchCriteria, urls, event_sink=None, scrap_id=None, cancel_check=None) -> list[Lead]:
+        """Run the autonomous collection/extraction pipeline on human-imported URL occurrences."""
+        sink = event_sink or NullJobEventSink()
+        url_list = list(urls)
+        emit_event(sink, "URLs", "Imported SERP URL occurrences", urls_total=len(url_list))
+        page_queue: asyncio.Queue[CollectedPage | None] = asyncio.Queue(maxsize=16)
+        loop = asyncio.get_running_loop()
+
+        def page_callback(page):
+            future = asyncio.run_coroutine_threadsafe(page_queue.put(page), loop)
+            future.result()
+
+        async def collect_stream():
+            try:
+                return await self.collector.collect_async(url_list, scrap_id=scrap_id, page_callback=page_callback, cancel_check=cancel_check)
+            finally:
+                await page_queue.put(None)
+
+        collector_task = asyncio.create_task(collect_stream())
+        leads: list[Lead] = []
+        emit_event(sink, "Extraction", "Processing pages incrementally")
+
+        page_index = 0
+        cancelled = False
+        while True:
+            page = await page_queue.get()
+            if page is None:
+                break
+            page_index += 1
+            if cancel_check and cancel_check():
+                cancelled = True
+                emit_event(sink, "Collection", "Job cancellation requested", state="canceled")
+            if cancelled:
+                continue
+            if page.status >= 400 or not _domain_allowed(page.url, self.domain_rules):
+                continue
+            if is_document_url(page.url, page.content_type):
+                try:
+                    document_text = extract_document_text(page.body, page.url, page.content_type)
+                except Exception:
+                    continue
+                if not document_text.strip():
+                    continue
+                html = f"<html><body><pre>{escape(document_text)}</pre></body></html>"
+                page_text = document_text
+            else:
+                if not page.html.strip():
+                    continue
+                html = page.html
+                page_text = page.text
+            evidence = self.evidence.build(url=page.url, html=html, text=page_text, status=page.status, rendered=False, source=page.source)
+            _persist_evidence(scrap_id, evidence)
+            emit_event(sink, "Evidence", f"Evidence persisted for page {page_index}", page=page_index, evidence=page_index)
+            try:
+                extracted = await self.extractor.extract(html, page.url, evidence=evidence)
+            except Exception as exc:
+                emit_event(
+                    sink,
+                    "Extraction",
+                    f"Extraction failed for page {page_index}: {type(exc).__name__}: {exc}",
+                    page=page_index,
+                    extracted=0,
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:1000],
+                )
+                extracted = []
+            qualified = [lead for lead in extracted if self.qualifier.qualify(lead, criteria).relevant]
+            leads.extend(qualified)
+            emit_event(sink, "Validation", f"Validated page {page_index}", page=page_index, extracted=len(extracted))
+            emit_event(sink, "Leads", "Lead candidates accepted", extracted=len(extracted), qualified=len(qualified), leads=len(leads))
+        crawl_result = await collector_task
+        emit_event(sink, "Collection", "Collection complete", pages_collected=len(crawl_result), urls_total=len(url_list))
+        final = dedupe(leads)[:criteria.max_leads]
+        emit_event(sink, "Qualification/Deduplication", "Qualification and deduplication complete", input_leads=len(leads), leads=len(final))
+        emit_event(sink, "Leads", "Lead set ready", state="complete", leads=len(final))
+        return final
 
     async def run_and_export(
         self,
         criteria: SearchCriteria,
         output: str = "output/leads.csv",
+        *,
+        google_spreadsheet_id: str | None = None,
+        google_worksheet: str = "Leads",
+        event_sink=None,
     ) -> str:
-        leads = await self.run(criteria)
+        leads = await self.run(criteria, event_sink=event_sink)
 
+        if google_spreadsheet_id:
+            return export_google_sheets(
+                leads, google_spreadsheet_id, worksheet=google_worksheet
+            )
         if output.lower().endswith(".xlsx"):
-            return export_xlsx(leads, output)
-
-        return export_csv(leads, output)
+            return str(export_xlsx(leads, output))
+        return str(export_csv(leads, output))
