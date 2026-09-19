@@ -7,6 +7,7 @@ from src.dedupe.leads import dedupe
 from src.extract.adaptive import AdaptiveLeadExtractor
 from src.extract.evidence import EvidenceBuilder
 from src.extract.documents import is_document_url, extract_document_text
+from src.extract.phone import extract_phone
 from html import escape
 from urllib.parse import urlparse
 import time
@@ -305,20 +306,22 @@ class LeadDiscoveryPipeline:
                 break
             url = str(record.get("url") or "").strip()
             snippet = str(record.get("snippet") or "").strip()
+            raw_text = str(record.get("raw_text") or "").strip()
             title = str(record.get("title") or "").strip()
             if not url or not (snippet or title):
                 continue
             html = f"<html><body><h1>{escape(title)}</h1><p>{escape(snippet)}</p></body></html>"
-            text = f"{title}\n{snippet}".strip()
+            text = f"{title}\n{snippet}\n{raw_text}".strip()
             evidence = self.evidence.build(url=url, html=html, text=text, status=200, rendered=True, source="serp-snippet")
             evidence_id = _persist_evidence(scrap_id, evidence)
             extracted = []
             candidate_text = title.replace("\xa0", " ").strip()
             import re as _re
+            phone_value = extract_phone(text, "FR" if "france" in str(criteria.geography or "").lower() else None)
             email_match = _re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, _re.I)
-            phone_match = _re.search(r"(?:\+\d[\d ()().-]{7,}\d|\b(?:0\d{1,3}[ ()-]?)?\d{2,4}[ ()-]\d{2,4}[ ()-]\d{2,4}\b)", text)
             parts = _re.split(r"\s+(?:-|–|—|\|)\s+", candidate_text, maxsplit=1)
             name_part = _re.sub(r"\s+(?:Email|Phone|Email & Phone Number|Contact)\b.*$", "", parts[0], flags=_re.I).strip()
+            name_part = _re.sub(r"^(?:Dr\.?|Doctor|Prof\.?|Professor|Mr\.?|Mrs\.?|Ms\.?|Miss)\s+", "", name_part, flags=_re.I).strip()
             name_part = _re.sub(r",?\s*(?:MD|MBBS|PhD|MSc|DO|RN|DDS|DMD)$", "", name_part, flags=_re.I).strip()
             name_words = name_part.split()
             role_part = parts[1].split("|",1)[0].strip() if len(parts)>1 else ""
@@ -327,11 +330,11 @@ class LeadDiscoveryPipeline:
             generic_name = bool(_re.search(r"\b(group|technology|healthcare|association|company|hospital|clinic|university|foundation|summit)\b", name_part, _re.I))
             if 2 <= len(name_words) <= 5 and not generic_name and (role_signal or company_signal):
                 try:
-                    payload={"first_name":name_words[0],"last_name":" ".join(name_words[1:]),"position":role_part if role_signal else None,"company_name":role_part if company_signal and not role_signal else None,"email":email_match.group(0) if email_match else None,"phone":self.serp_extractor._normalize_phone(phone_match.group(0)) if phone_match else None,"source_url":url,"capture_stage":"serp"}
+                    payload={"first_name":name_words[0],"last_name":" ".join(name_words[1:]),"position":role_part if role_signal else None,"company_name":role_part if company_signal and not role_signal else None,"email":email_match.group(0) if email_match else None,"phone":phone_value,"source_url":url,"capture_stage":"serp"}
                     extracted=[Lead.model_validate(payload, context={"generic_prefixes":self.generic_prefixes,"allow_serp_without_email":True})]
                 except (ValidationError, TypeError, ValueError):
                     extracted=[]
-            if not extracted and (email_match or phone_match):
+            if not extracted and (email_match or phone_value):
                 try:
                     extracted = await self.serp_extractor.extract(html, url, evidence=evidence)
                 except Exception as exc:
@@ -360,6 +363,11 @@ class LeadDiscoveryPipeline:
         emit_event(sink, "URLs", "Imported SERP result occurrences", urls_total=len(urls), snippets=sum(bool(r.get("snippet", "").strip()) for r in records))
         leads: list[Lead] = []
         extracted_total = qualified_total = persisted_total = extraction_failures = 0
+        if scrap_id:
+            import uuid as _uuid
+            from src.db import db as _db
+            with _db() as conn:
+                persisted_total = int(conn.execute("SELECT count(*) FROM leads WHERE scrap_id=%s", (_uuid.UUID(str(scrap_id)),)).fetchone()[0])
         started_at = time.monotonic()
         timeout_seconds = self.crawler_config.max_duration_hours * 3600
         stop_reason = None
@@ -384,16 +392,17 @@ class LeadDiscoveryPipeline:
             if should_stop_harvest():
                 break
             snippet = str(record.get("snippet", "")).strip()
-            if not snippet:
+            raw_text = str(record.get("raw_text", "")).strip()
+            if not (snippet or raw_text):
                 continue
             url = record.get("url")
             if not url:
                 continue
             title = str(record.get("title", "")).strip()
-            snippet_text = f"{title}\n{snippet}".strip()
+            snippet_text = f"{title}\n{snippet}\n{raw_text}".strip()
             html = f"<html><body><h1>{escape(title)}</h1><p>{escape(snippet)}</p></body></html>"
             evidence = self.evidence.build(url=url, html=html, text=snippet_text, status=200, rendered=True, source="serp-snippet")
-            _persist_evidence(scrap_id, evidence)
+            evidence_id = _persist_evidence(scrap_id, evidence)
             emit_event(sink, "Evidence", f"SERP snippet evidence persisted {index}", evidence=index)
             try:
                 extracted = await self.serp_extractor.extract(html, url, evidence=evidence)

@@ -440,8 +440,8 @@ def scrap_serp_results(scrap_id: str, req: Request):
     with db() as conn:
         owned=conn.execute("SELECT 1 FROM scraps WHERE id=%s AND user_id=%s",(sid,uuid.UUID(user["id"]))).fetchone()
         if not owned: raise HTTPException(404,"Scrap not found")
-        rows=conn.execute("SELECT id,url,title,snippet,provider,page_url,captured_at FROM serp_results WHERE scrap_id=%s ORDER BY captured_at,id",(sid,)).fetchall()
-    return [{"id":str(r[0]),"url":r[1],"title":r[2],"snippet":r[3],"provider":r[4],"page_url":r[5],"created_at":r[6].isoformat()} for r in rows]
+        rows=conn.execute("SELECT id,url,title,snippet,raw_text,provider,page_url,captured_at FROM serp_results WHERE scrap_id=%s ORDER BY captured_at,id",(sid,)).fetchall()
+    return [{"id":str(r[0]),"url":r[1],"title":r[2],"snippet":r[3],"raw_text":r[4],"provider":r[5],"page_url":r[6],"created_at":r[7].isoformat()} for r in rows]
 
 @app.get("/scraps/{scrap_id}/url-occurrences")
 def scrap_url_occurrences(scrap_id: str, req: Request):
@@ -505,6 +505,7 @@ class SerpResult(BaseModel):
     url: str=Field(min_length=1,max_length=8192)
     title: str=""
     snippet: str=""
+    raw_text: str=""
     provider: Literal["google","bing"]|None=None
     page_url: str|None=None
 
@@ -582,7 +583,7 @@ def premium_serp(request: PremiumSerpRequest, req: Request):
             if current_used + len(valid) > limit:
                 raise HTTPException(409,f"SERP result limit reached during persistence: {current_used}/{limit}")
             for item in valid:
-                rid=uuid.uuid4(); conn.execute("INSERT INTO serp_results(id,scrap_id,url,title,snippet,provider,page_url) VALUES(%s,%s,%s,%s,%s,%s,%s)",(rid,sid,item.url,item.title,item.snippet,provider,item.page_url or request.search_url))
+                rid=uuid.uuid4(); conn.execute("INSERT INTO serp_results(id,scrap_id,url,title,snippet,raw_text,provider,page_url) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",(rid,sid,item.url,item.title,item.snippet,item.raw_text,provider,item.page_url or request.search_url))
                 conn.execute("INSERT INTO url_occurrences(id,scrap_id,url,serp_result_id) VALUES(%s,%s,%s,%s)",(uuid.uuid4(),sid,item.url,rid))
             conn.execute("INSERT INTO serp_sources(id,scrap_id,provider,query,url) VALUES(%s,%s,%s,%s,%s)",(uuid.uuid4(),sid,provider,query,request.search_url.strip()))
             result={"extraction_id":str(extraction_id),"scrap_id":str(sid),"provider":provider,"query":query,"search_url":request.search_url.strip(),"found_results":len(valid),"results":len(valid),"charged_cents":price,"balance_cents":balance_after}
@@ -612,7 +613,7 @@ def sync_serp(request: SerpSyncRequest, req: Request):
         used=conn.execute("SELECT count(*) FROM serp_results WHERE scrap_id=%s",(uuid.UUID(scrap_id),)).fetchone()[0]
         if used + len(request.results) > limit: raise HTTPException(409,f"SERP result limit reached: {used}/{limit}; import rejected")
         for item in request.results:
-            rid=uuid.uuid4(); conn.execute("INSERT INTO serp_results(id,scrap_id,url,title,snippet,provider,page_url) VALUES(%s,%s,%s,%s,%s,%s,%s)",(rid,uuid.UUID(scrap_id),item.url,item.title[:1000],item.snippet[:5000],item.provider,item.page_url))
+            rid=uuid.uuid4(); conn.execute("INSERT INTO serp_results(id,scrap_id,url,title,snippet,raw_text,provider,page_url) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",(rid,uuid.UUID(scrap_id),item.url,item.title[:1000],item.snippet[:5000],item.raw_text[:10000],item.provider,item.page_url))
             conn.execute("INSERT INTO url_occurrences(id,scrap_id,url,serp_result_id) VALUES(%s,%s,%s,%s)",(uuid.uuid4(),uuid.UUID(scrap_id),item.url,rid))
         conn.commit()
     return {"scrap_id":scrap_id,"results":len(request.results),"urls":len(request.results)}
@@ -825,7 +826,7 @@ def import_serp_urls(request: SerpImportRequest, req: Request, background_tasks:
                 duplicate=conn.execute("SELECT 1 FROM serp_results WHERE scrap_id=%s AND url=%s LIMIT 1",(scrap_id,item["url"])).fetchone()
                 if duplicate: continue
                 if used + added >= limit: raise HTTPException(409,f"SERP result limit reached: {used}/{limit}; import rejected")
-                rid=uuid.uuid4(); conn.execute("INSERT INTO serp_results(id,scrap_id,url,title,snippet,provider,page_url) VALUES(%s,%s,%s,%s,%s,%s,%s)",(rid,scrap_id,item["url"],item.get("title","")[:1000],item.get("snippet","")[:5000],item.get("provider"),item.get("page_url")))
+                rid=uuid.uuid4(); conn.execute("INSERT INTO serp_results(id,scrap_id,url,title,snippet,raw_text,provider,page_url) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",(rid,scrap_id,item["url"],item.get("title","")[:1000],item.get("snippet","")[:5000],item.get("raw_text","")[:10000],item.get("provider"),item.get("page_url")))
                 conn.execute("INSERT INTO url_occurrences(id,scrap_id,url,serp_result_id) VALUES(%s,%s,%s,%s)",(uuid.uuid4(),scrap_id,item["url"],rid)); added+=1; new_results.append(item)
         conn.execute("UPDATE serp_sessions SET urls=%s,results=%s,imports=%s WHERE token=%s",(Jsonb(session["urls"]),Jsonb(session["results"]),Jsonb(session["imports"]),request.token))
         conn.commit()
@@ -1009,11 +1010,11 @@ async def create_url_job(request: UrlImportRequest,background_tasks: BackgroundT
         row=conn.execute("SELECT status,criteria,crawler_config FROM scraps WHERE id=%s AND user_id=%s FOR UPDATE",(uuid.UUID(request.scrap_id),uuid.UUID(user["id"]))).fetchone()
         if not row: raise HTTPException(404,"Scrap not found")
         if row[0] != 'submitted': raise HTTPException(409,"Scrap must be submitted before research can start")
-        serp_rows=conn.execute("SELECT url,title,snippet,provider,page_url FROM serp_results WHERE scrap_id=%s ORDER BY id",(uuid.UUID(request.scrap_id),)).fetchall()
+        serp_rows=conn.execute("SELECT url,title,snippet,raw_text,provider,page_url FROM serp_results WHERE scrap_id=%s ORDER BY id",(uuid.UUID(request.scrap_id),)).fetchall()
     if not serp_rows: raise HTTPException(422,"At least one collected SERP result is required")
     request.criteria=SearchCriteria.model_validate(row[1] or {})
     request.crawler=CrawlerConfig.model_validate(row[2] or {})
-    request.results=[SerpResult(url=r[0],title=r[1] or '',snippet=r[2] or '',provider=r[3],page_url=r[4]) for r in serp_rows]
+    request.results=[SerpResult(url=r[0],title=r[1] or '',snippet=r[2] or '',raw_text=r[3] or '',provider=r[4],page_url=r[5]) for r in serp_rows]
     request.urls=[r.url for r in request.results]
     job_id=uuid.uuid4().hex; JOBS[job_id]={"job_id":job_id,"status":"queued","stage":"Queued","message":"URL crawl queued","counts":{},"events":[],"lead_count":0,"export_format":request.export_format}
     with db() as conn: conn.execute("INSERT INTO jobs(id,scrap_id,status,stage,payload,result) VALUES(%s,%s,%s,%s,%s,%s)",(uuid.UUID(job_id),uuid.UUID(request.scrap_id),"queued","Queued",Jsonb(request.model_dump()),Jsonb({"message":"URL crawl queued","counts":{},"events":[]})));conn.commit()
