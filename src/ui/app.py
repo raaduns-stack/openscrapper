@@ -340,6 +340,13 @@ elif page=='Current Scrap':
             st.info('No SERP results have been saved yet. Open a Google/Bing search and use the extension to capture results.')
         if current_results:
             st.dataframe(current_results[:5000],use_container_width=True,hide_index=True)
+        captured_leads=api_json("GET",f"/scraps/{st.session_state.scrap_id}/results")
+        st.subheader("SERP leads captured")
+        if captured_leads:
+            st.success("{} lead(s) have been captured and saved. Scrapy will enrich these records after URL submission.".format(len(captured_leads)))
+            st.dataframe([r["data"] for r in captured_leads],use_container_width=True,hide_index=True)
+        else:
+            st.info("No qualified leads captured from SERP yet. Leads will appear here as SERP processing validates and saves them.")
         if live['status'] in ('active','running'):
             st.subheader('3. Finish URL submission')
             st.caption('When you have finished browsing and collecting results, click the button below. This ends the active collection phase and releases the Current Scrap lock.')
