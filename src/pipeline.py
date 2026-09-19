@@ -311,11 +311,32 @@ class LeadDiscoveryPipeline:
             text = f"{title}\n{snippet}".strip()
             evidence = self.evidence.build(url=url, html=html, text=text, status=200, rendered=True, source="serp-snippet")
             evidence_id = _persist_evidence(scrap_id, evidence)
-            try:
-                extracted = await self.serp_extractor.extract(html, url, evidence=evidence)
-            except Exception as exc:
-                emit_event(sink, "Extraction", f"SERP extraction failed {index}: {type(exc).__name__}", evidence=index, extracted=0, error=str(exc)[:500])
-                continue
+            extracted = []
+            candidate_text = title.replace("\xa0", " ").strip()
+            import re as _re
+            email_match = _re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, _re.I)
+            phone_match = _re.search(r"(?:\+\d[\d ()().-]{7,}\d|\b(?:0\d{1,3}[ ()-]?)?\d{2,4}[ ()-]\d{2,4}[ ()-]\d{2,4}\b)", text)
+            parts = _re.split(r"\s+(?:-|–|—|\|)\s+", candidate_text, maxsplit=1)
+            name_part = _re.sub(r"\s+(?:Email|Phone|Email & Phone Number|Contact)\b.*$", "", parts[0], flags=_re.I).strip()
+            name_part = _re.sub(r",?\s*(?:MD|MBBS|PhD|MSc|DO|RN|DDS|DMD)$", "", name_part, flags=_re.I).strip()
+            name_words = name_part.split()
+            role_part = parts[1].split("|",1)[0].strip() if len(parts)>1 else ""
+            role_signal = bool(_re.search(r"\b(doctor|physician|surgeon|medical|dentist|nurse|director|manager|chief|professor|consultant|specialist|researcher|therapist)\b", role_part, _re.I))
+            company_signal = bool(_re.search(r"\b(group|technology|healthcare|association|company|hospital|clinic|university|foundation|summit)\b", role_part, _re.I))
+            generic_name = bool(_re.search(r"\b(group|technology|healthcare|association|company|hospital|clinic|university|foundation|summit)\b", name_part, _re.I))
+            if 2 <= len(name_words) <= 5 and not generic_name and (role_signal or company_signal):
+                try:
+                    payload={"first_name":name_words[0],"last_name":" ".join(name_words[1:]),"position":role_part if role_signal else None,"company_name":role_part if company_signal and not role_signal else None,"email":email_match.group(0) if email_match else None,"phone":self.serp_extractor._normalize_phone(phone_match.group(0)) if phone_match else None,"source_url":url,"capture_stage":"serp"}
+                    extracted=[Lead.model_validate(payload, context={"generic_prefixes":self.generic_prefixes,"allow_serp_without_email":True})]
+                except (ValidationError, TypeError, ValueError):
+                    extracted=[]
+            if not extracted and (email_match or phone_match):
+                try:
+                    extracted = await self.serp_extractor.extract(html, url, evidence=evidence)
+                except Exception as exc:
+                    emit_event(sink, "Extraction", f"SERP extraction failed {index}: {type(exc).__name__}", evidence=index, extracted=0, error=str(exc)[:500])
+                    continue
+            extracted = [lead.model_copy(update={"capture_stage":"serp"}) for lead in extracted]
             qualified = [lead for lead in extracted if self.qualifier.qualify(lead, criteria).relevant]
             extracted_total += len(extracted)
             qualified_total += len(qualified)
