@@ -91,6 +91,7 @@ class LeadDiscoveryPipeline:
         crawler_config: CrawlerConfig | None = None,
         generic_prefixes: set[str] | None = None,
         domain_rules: list[tuple[str, str]] | None = None,
+        llm_call_counter=None,
     ):
         self.crawler_config = crawler_config or CrawlerConfig(max_crawl_pages=max_pages)
         self.generic_prefixes = generic_prefixes
@@ -101,8 +102,8 @@ class LeadDiscoveryPipeline:
             max_urls=self.crawler_config.max_crawl_urls,
             max_depth=self.crawler_config.max_crawl_depth,
         )
-        self.extractor = AdaptiveLeadExtractor(model=model, generic_prefixes=generic_prefixes)
-        self.serp_extractor = AdaptiveLeadExtractor(model=model, generic_prefixes=generic_prefixes, allow_emailless=True)
+        self.extractor = AdaptiveLeadExtractor(model=model, generic_prefixes=generic_prefixes, llm_call_counter=llm_call_counter)
+        self.serp_extractor = AdaptiveLeadExtractor(model=model, generic_prefixes=generic_prefixes, allow_emailless=True, llm_call_counter=llm_call_counter)
         self.qualifier = LeadQualifier()
         self.evidence = EvidenceBuilder()
 

@@ -476,9 +476,9 @@ def get_scrap(scrap_id: str, req: Request):
     with db() as conn:
         row=conn.execute("SELECT id,name,status,criteria,crawler_config,created_at,completed_at FROM scraps WHERE id=%s AND user_id=%s",(uuid.UUID(scrap_id),uuid.UUID(user["id"]))).fetchone()
         if not row: raise HTTPException(404,"Scrap not found")
-        counts=conn.execute("SELECT (SELECT count(*) FROM serp_results WHERE scrap_id=%s),(SELECT count(*) FROM url_occurrences WHERE scrap_id=%s),(SELECT count(*) FROM leads WHERE scrap_id=%s),(SELECT count(*) FROM crawl_pages WHERE scrap_id=%s)",(uuid.UUID(scrap_id),)*4).fetchone()
+        counts=conn.execute("SELECT (SELECT count(*) FROM serp_results WHERE scrap_id=%s),(SELECT count(*) FROM url_occurrences WHERE scrap_id=%s),(SELECT count(*) FROM leads WHERE scrap_id=%s),(SELECT count(*) FROM crawl_pages WHERE scrap_id=%s),llm_calls FROM scraps WHERE id=%s",(uuid.UUID(scrap_id),)*5).fetchone()
         serp_limit=_serp_limit(conn)
-    return {"id":str(row[0]),"name":row[1],"status":row[2],"criteria":row[3],"crawler":row[4],"created_at":row[5].isoformat(),"completed_at":row[6].isoformat() if row[6] else None,"counts":{"serp_results":counts[0],"url_occurrences":counts[1],"leads":counts[2],"crawl_pages":counts[3]},"serp_limit":serp_limit}
+    return {"id":str(row[0]),"name":row[1],"status":row[2],"criteria":row[3],"crawler":row[4],"created_at":row[5].isoformat(),"completed_at":row[6].isoformat() if row[6] else None,"counts":{"serp_results":counts[0],"url_occurrences":counts[1],"leads":counts[2],"crawl_pages":counts[3],"llm_calls":counts[4]},"serp_limit":serp_limit}
 
 class JobRequest(BaseModel):
     scrap_id: str|None=None
@@ -781,6 +781,12 @@ def add_serp_source(request: SerpSourceRequest, req: Request):
             conn.execute("INSERT INTO serp_sources(id,scrap_id,provider,query,url) VALUES(%s,%s,%s,%s,%s)",(uuid.uuid4(),uuid.UUID(session["scrap_id"]),provider,query,request.url.strip()));conn.commit()
     return source
 
+def _increment_llm_calls(scrap_id: str):
+    with db() as conn:
+        conn.execute("UPDATE scraps SET llm_calls=llm_calls+1 WHERE id=%s", (uuid.UUID(scrap_id),))
+        conn.commit()
+
+
 def _process_serp_leads_background(scrap_id: str, records: list[dict]):
     try:
         with db() as conn:
@@ -791,7 +797,7 @@ def _process_serp_leads_background(scrap_id: str, records: list[dict]):
         criteria = SearchCriteria.model_validate(raw_criteria or {})
         crawler = CrawlerConfig.model_validate(raw_crawler or {})
         prefixes, rules = get_client_policies(str(user_id))
-        pipeline = LeadDiscoveryPipeline(crawler_config=crawler, generic_prefixes=prefixes, domain_rules=rules)
+        pipeline = LeadDiscoveryPipeline(crawler_config=crawler, generic_prefixes=prefixes, domain_rules=rules, llm_call_counter=lambda: _increment_llm_calls(scrap_id))
         asyncio.run(pipeline.process_serp_records(criteria, records, scrap_id=scrap_id))
     except Exception as exc:
         print(f"serp_lead_processing_error={scrap_id}: {type(exc).__name__}: {exc}")

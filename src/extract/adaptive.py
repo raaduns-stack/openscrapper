@@ -2,6 +2,7 @@ import inspect
 import json
 import os
 import re
+from collections.abc import Callable
 
 from bs4 import BeautifulSoup
 from parsel import Selector
@@ -27,10 +28,11 @@ class AdaptiveLeadExtractor:
 
     LLM_MAX_ATTEMPTS = 2
 
-    def __init__(self, model: str = "openai/gpt-oss-20b", generic_prefixes: set[str] | None = None, allow_emailless: bool = False):
+    def __init__(self, model: str = "openai/gpt-oss-20b", generic_prefixes: set[str] | None = None, allow_emailless: bool = False, llm_call_counter: Callable[[], None] | None = None):
         self.model = model
         self.generic_prefixes = generic_prefixes
         self.allow_emailless = allow_emailless
+        self.llm_call_counter = llm_call_counter
         self.agent = None
         self.evidence_builder = EvidenceBuilder()
         self.candidate_builder = CandidateBuilder()
@@ -418,6 +420,8 @@ class AdaptiveLeadExtractor:
                     "Preserve source_url exactly."
                 )
             try:
+                if self.llm_call_counter:
+                    self.llm_call_counter()
                 result = await agent.run(attempt_prompt)
                 break
             except Exception:

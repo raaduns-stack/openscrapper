@@ -285,7 +285,7 @@ elif page=='Current Scrap':
         if st.button('↻ Refresh Current Scrap',key='refresh-current'):
             st.rerun()
         st.info('Work on this Scrap until you have finished collecting Google/Bing results. Your collection is saved to Scrappee as it arrives.')
-        a,b,c,d=st.columns(4);a.metric('SERP results',live['counts']['serp_results']);b.metric('URL occurrences',live['counts']['url_occurrences']);c.metric('Leads',live['counts']['leads']);d.metric('SERP capacity',f"{live['counts']['serp_results']} / {live['serp_limit']}")
+        a,b,c,d,e=st.columns(5);a.metric('SERP results',live['counts']['serp_results']);b.metric('URL occurrences',live['counts']['url_occurrences']);c.metric('Leads',live['counts']['leads']);d.metric('LLM calls',live['counts'].get('llm_calls',0));e.metric('SERP capacity',f"{live['counts']['serp_results']} / {live['serp_limit']}")
         if live['counts']['serp_results'] >= live['serp_limit']: st.warning('SERP capacity reached. Further SERP imports are blocked until this Scrap is closed.')
         research_running = live['status']=='running' and current_job and current_job.get('status') in ('queued','running')
         if research_running:
