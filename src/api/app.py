@@ -781,8 +781,24 @@ def add_serp_source(request: SerpSourceRequest, req: Request):
             conn.execute("INSERT INTO serp_sources(id,scrap_id,provider,query,url) VALUES(%s,%s,%s,%s,%s)",(uuid.uuid4(),uuid.UUID(session["scrap_id"]),provider,query,request.url.strip()));conn.commit()
     return source
 
+def _process_serp_leads_background(scrap_id: str, records: list[dict]):
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT user_id,criteria,crawler_config FROM scraps WHERE id=%s", (uuid.UUID(scrap_id),)).fetchone()
+        if not row:
+            return
+        user_id, raw_criteria, raw_crawler = row
+        criteria = SearchCriteria.model_validate(raw_criteria or {})
+        crawler = CrawlerConfig.model_validate(raw_crawler or {})
+        prefixes, rules = get_client_policies(str(user_id))
+        pipeline = LeadDiscoveryPipeline(crawler_config=crawler, generic_prefixes=prefixes, domain_rules=rules)
+        asyncio.run(pipeline.process_serp_records(criteria, records, scrap_id=scrap_id))
+    except Exception as exc:
+        print(f"serp_lead_processing_error={scrap_id}: {type(exc).__name__}: {exc}")
+
+
 @app.post("/serp/import")
-def import_serp_urls(request: SerpImportRequest, req: Request):
+def import_serp_urls(request: SerpImportRequest, req: Request, background_tasks: BackgroundTasks):
     auth=req.headers.get("Authorization")
     user=current_user(req) if auth else None
     session=_serp_session(request.token,user["id"] if user else None)
@@ -798,15 +814,18 @@ def import_serp_urls(request: SerpImportRequest, req: Request):
             conn.execute("SELECT id FROM scraps WHERE id=%s FOR UPDATE",(scrap_id,))
             limit=_serp_limit(conn); used=conn.execute("SELECT count(*) FROM serp_results WHERE scrap_id=%s",(scrap_id,)).fetchone()[0]
             added=0
+            new_results=[]
             for item in results:
                 duplicate=conn.execute("SELECT 1 FROM serp_results WHERE scrap_id=%s AND url=%s LIMIT 1",(scrap_id,item["url"])).fetchone()
                 if duplicate: continue
                 if used + added >= limit: raise HTTPException(409,f"SERP result limit reached: {used}/{limit}; import rejected")
                 rid=uuid.uuid4(); conn.execute("INSERT INTO serp_results(id,scrap_id,url,title,snippet,provider,page_url) VALUES(%s,%s,%s,%s,%s,%s,%s)",(rid,scrap_id,item["url"],item.get("title","")[:1000],item.get("snippet","")[:5000],item.get("provider"),item.get("page_url")))
-                conn.execute("INSERT INTO url_occurrences(id,scrap_id,url,serp_result_id) VALUES(%s,%s,%s,%s)",(uuid.uuid4(),scrap_id,item["url"],rid)); added+=1
+                conn.execute("INSERT INTO url_occurrences(id,scrap_id,url,serp_result_id) VALUES(%s,%s,%s,%s)",(uuid.uuid4(),scrap_id,item["url"],rid)); added+=1; new_results.append(item)
         conn.execute("UPDATE serp_sessions SET urls=%s,results=%s,imports=%s WHERE token=%s",(Jsonb(session["urls"]),Jsonb(session["results"]),Jsonb(session["imports"]),request.token))
         conn.commit()
-    return {"count":len(urls),"results":len(results),"total":len(session["urls"]),"page_url":request.page_url}
+    if new_results and session.get("scrap_id"):
+        background_tasks.add_task(_process_serp_leads_background, session["scrap_id"], new_results)
+    return {"count":len(urls),"results":len(results),"new_results":len(new_results),"total":len(session["urls"]),"page_url":request.page_url}
 
 def _persist_job(job_id, **fields):
     with db() as conn:

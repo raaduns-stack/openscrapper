@@ -293,6 +293,43 @@ class LeadDiscoveryPipeline:
             yield page
         await collector_task
 
+    async def process_serp_records(self, criteria: SearchCriteria, results, event_sink=None, scrap_id=None, cancel_check=None) -> list[Lead]:
+        """Extract and persist leads from SERP title/snippet evidence without crawling destination URLs."""
+        sink = event_sink or NullJobEventSink()
+        records = [r if isinstance(r, dict) else r.model_dump() for r in results]
+        leads: list[Lead] = []
+        extracted_total = qualified_total = persisted_total = 0
+        for index, record in enumerate(records, start=1):
+            if cancel_check and cancel_check():
+                break
+            url = str(record.get("url") or "").strip()
+            snippet = str(record.get("snippet") or "").strip()
+            title = str(record.get("title") or "").strip()
+            if not url or not (snippet or title):
+                continue
+            html = f"<html><body><h1>{escape(title)}</h1><p>{escape(snippet)}</p></body></html>"
+            text = f"{title}\n{snippet}".strip()
+            evidence = self.evidence.build(url=url, html=html, text=text, status=200, rendered=True, source="serp-snippet")
+            evidence_id = _persist_evidence(scrap_id, evidence)
+            try:
+                extracted = await self.serp_extractor.extract(html, url, evidence=evidence)
+            except Exception as exc:
+                emit_event(sink, "Extraction", f"SERP extraction failed {index}: {type(exc).__name__}", evidence=index, extracted=0, error=str(exc)[:500])
+                continue
+            qualified = [lead for lead in extracted if self.qualifier.qualify(lead, criteria).relevant]
+            extracted_total += len(extracted)
+            qualified_total += len(qualified)
+            persisted = 0
+            for lead in qualified:
+                if _persist_lead(scrap_id, lead, evidence_id=evidence_id):
+                    persisted += 1
+                    persisted_total += 1
+                leads.append(lead)
+            emit_event(sink, "Leads", "SERP leads persisted", extracted=len(extracted), qualified=len(qualified), persisted=persisted, leads=len(leads), extracted_total=extracted_total, qualified_total=qualified_total, persisted_total=persisted_total)
+            if scrap_id and persisted_total >= criteria.max_leads:
+                break
+        return leads
+
     async def run_harvested(self, criteria: SearchCriteria, results, event_sink=None, scrap_id=None, cancel_check=None) -> list[Lead]:
         """Process SERP result occurrences, including snippets as first-class evidence."""
         sink = event_sink or NullJobEventSink()
