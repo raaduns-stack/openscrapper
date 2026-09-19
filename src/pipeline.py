@@ -317,29 +317,34 @@ class LeadDiscoveryPipeline:
             extracted = []
             candidate_text = title.replace("\xa0", " ").strip()
             import re as _re
-            phone_value = extract_phone(text, "FR" if "france" in str(criteria.geography or "").lower() else None)
             email_match = _re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, _re.I)
+            phone_value = extract_phone(text, None)
             parts = _re.split(r"\s+(?:-|–|—|\|)\s+", candidate_text, maxsplit=1)
-            name_part = _re.sub(r"\s+(?:Email|Phone|Email & Phone Number|Contact)\b.*$", "", parts[0], flags=_re.I).strip()
-            name_part = _re.sub(r"^(?:Dr\.?|Doctor|Prof\.?|Professor|Mr\.?|Mrs\.?|Ms\.?|Miss)\s+", "", name_part, flags=_re.I).strip()
+            name_part = _re.sub(r"^(?:Dr\.?|Doctor|Prof\.?|Professor|Mr\.?|Mrs\.?|Ms\.?|Miss)\s+", "", parts[0], flags=_re.I).strip()
             name_part = _re.sub(r",?\s*(?:MD|MBBS|PhD|MSc|DO|RN|DDS|DMD)$", "", name_part, flags=_re.I).strip()
             name_words = name_part.split()
-            role_part = parts[1].split("|",1)[0].strip() if len(parts)>1 else ""
-            role_signal = bool(_re.search(r"\b(doctor|physician|surgeon|medical|dentist|nurse|director|manager|chief|professor|consultant|specialist|researcher|therapist)\b", role_part, _re.I))
-            company_signal = bool(_re.search(r"\b(group|technology|healthcare|association|company|hospital|clinic|university|foundation|summit)\b", role_part, _re.I))
-            generic_name = bool(_re.search(r"\b(group|technology|healthcare|association|company|hospital|clinic|university|foundation|summit)\b", name_part, _re.I))
-            if 2 <= len(name_words) <= 5 and not generic_name and (role_signal or company_signal):
+            role_part = parts[1].split("|", 1)[0].strip() if len(parts) > 1 else ""
+            company_name = None
+            position = role_part or None
+            at_match = _re.match(r"(.+?)\s+at\s+(.+)$", role_part, _re.I)
+            if at_match:
+                position = at_match.group(1).strip()
+                company_name = at_match.group(2).strip()
+            geography = str(criteria.geography or "").strip()
+            country = geography if geography else None
+            city = None
+            location_match = _re.search(r"([A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'’.-]+(?:\s+[A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'’.-]+)*),\s*([A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'’.-]+(?:\s+[A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'’.-]+)*)", text)
+            if location_match:
+                city = location_match.group(1).strip()
+                detected_country = location_match.group(2).strip()
+                if not country or detected_country.lower() == country.lower(): country = detected_country
+            if 2 <= len(name_words) <= 5 and (position or company_name) and not _re.search(r"\b(group|technology|healthcare|association|company|hospital|clinic|university|foundation|summit)\b", name_part, _re.I):
                 try:
-                    payload={"first_name":name_words[0],"last_name":" ".join(name_words[1:]),"position":role_part if role_signal else None,"company_name":role_part if company_signal and not role_signal else None,"email":email_match.group(0) if email_match else None,"phone":phone_value,"source_url":url,"capture_stage":"serp"}
+                    payload={"first_name":name_words[0],"last_name":" ".join(name_words[1:]),"position":position,"company_name":company_name,"email":email_match.group(0) if email_match else None,"phone":phone_value,"city":city,"country":country,"source_url":url,"capture_stage":"serp"}
                     extracted=[Lead.model_validate(payload, context={"generic_prefixes":self.generic_prefixes,"allow_serp_without_email":True})]
                 except (ValidationError, TypeError, ValueError):
                     extracted=[]
-            if not extracted and (email_match or phone_value):
-                try:
-                    extracted = await self.serp_extractor.extract(html, url, evidence=evidence)
-                except Exception as exc:
-                    emit_event(sink, "Extraction", f"SERP extraction failed {index}: {type(exc).__name__}", evidence=index, extracted=0, error=str(exc)[:500])
-                    continue
+            # SERP master records are deterministic evidence. Never invoke the LLM here.
             extracted = [lead.model_copy(update={"capture_stage":"serp"}) for lead in extracted]
             qualified = [lead for lead in extracted if self.qualifier.qualify(lead, criteria).relevant]
             extracted_total += len(extracted)
