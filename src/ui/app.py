@@ -344,7 +344,15 @@ elif page=='Current Scrap':
         st.subheader("SERP leads captured")
         if captured_leads:
             st.success("{} lead(s) have been captured and saved. Scrapy will enrich these records after URL submission.".format(len(captured_leads)))
-            st.dataframe([r["data"] for r in captured_leads],use_container_width=True,hide_index=True)
+            captured_leads_data = [r["data"] for r in captured_leads]
+            st.download_button(
+                "Download captured leads CSV",
+                data=__import__("pandas").DataFrame(captured_leads_data).to_csv(index=False).encode("utf-8"),
+                file_name=f"serp-leads-{st.session_state.scrap_id}.csv",
+                mime="text/csv",
+                key="download-captured-leads-csv",
+            )
+            st.dataframe(captured_leads_data,use_container_width=True,hide_index=True)
         else:
             st.info("No qualified leads captured from SERP yet. Leads will appear here as SERP processing validates and saves them.")
         if live['status'] in ('active','running'):

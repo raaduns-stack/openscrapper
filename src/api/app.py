@@ -10,7 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 from src.models.criteria import CrawlerConfig, SearchCriteria
+from src.models.lead import Lead
 from src.pipeline import LeadDiscoveryPipeline
+from src.dedupe.leads import persist_lead
 from src.observability.job_events import JobEventSink
 from src.search.strategy import SearchStrategyEngine
 from src.search.premium import HttpPremiumSerpProvider, parse_search_url, SUPPORTED_PROVIDERS, provider_statuses, save_provider_config
@@ -434,6 +436,34 @@ def scrap_results(scrap_id: str, req: Request):
         rows=conn.execute("SELECT id,data,created_at FROM leads WHERE scrap_id=%s ORDER BY created_at DESC",(uuid.UUID(scrap_id),)).fetchall()
     return [{"id":str(r[0]),"data":r[1],"created_at":r[2].isoformat()} for r in rows]
 
+@app.post("/scraps/{scrap_id}/leads/{lead_id}/enrich", status_code=202)
+async def enrich_lead(scrap_id: str, lead_id: str, background_tasks: BackgroundTasks, req: Request):
+    user = current_user(req)
+    sid = uuid.UUID(scrap_id)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT l.data FROM leads l JOIN scraps s ON s.id=l.scrap_id "
+            "WHERE l.id=%s AND l.scrap_id=%s AND s.user_id=%s",
+            (uuid.UUID(lead_id), sid, uuid.UUID(user["id"])),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Lead not found")
+        running = conn.execute(
+            "SELECT 1 FROM jobs WHERE scrap_id=%s AND status IN ('queued','running') LIMIT 1",
+            (sid,),
+        ).fetchone()
+        if running:
+            raise HTTPException(409, "Research is already running for this Scrap")
+        job_id = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO jobs(id,scrap_id,status,stage,payload,result) VALUES(%s,%s,'queued','Queued',%s,%s)",
+            (uuid.UUID(job_id), sid, Jsonb({"type": "enrich_lead", "lead_id": lead_id}), Jsonb({"message": "Enrichment queued", "counts": {}, "events": []})),
+        )
+        conn.commit()
+    background_tasks.add_task(_run_enrich_job, job_id, scrap_id, lead_id)
+    return {"job_id": job_id, "status": "queued", "lead_id": lead_id}
+
+
 @app.get("/scraps/{scrap_id}/serp-results")
 def scrap_serp_results(scrap_id: str, req: Request):
     user=current_user(req); sid=uuid.UUID(scrap_id)
@@ -479,6 +509,10 @@ def get_scrap(scrap_id: str, req: Request):
         counts=conn.execute("SELECT (SELECT count(*) FROM serp_results WHERE scrap_id=%s),(SELECT count(*) FROM url_occurrences WHERE scrap_id=%s),(SELECT count(*) FROM leads WHERE scrap_id=%s),(SELECT count(*) FROM crawl_pages WHERE scrap_id=%s),llm_calls FROM scraps WHERE id=%s",(uuid.UUID(scrap_id),)*5).fetchone()
         serp_limit=_serp_limit(conn)
     return {"id":str(row[0]),"name":row[1],"status":row[2],"criteria":row[3],"crawler":row[4],"created_at":row[5].isoformat(),"completed_at":row[6].isoformat() if row[6] else None,"counts":{"serp_results":counts[0],"url_occurrences":counts[1],"leads":counts[2],"crawl_pages":counts[3],"llm_calls":counts[4]},"serp_limit":serp_limit}
+
+class EnrichLeadRequest(BaseModel):
+    lead_id: str = Field(min_length=1, max_length=64)
+
 
 class JobRequest(BaseModel):
     scrap_id: str|None=None
@@ -913,20 +947,80 @@ def _run_job(job_id,request):
             with db() as conn: conn.execute("UPDATE scraps SET status='failed',completed_at=now() WHERE id=%s",(uuid.UUID(request.scrap_id),)); conn.commit()
 
 def _persist_leads(scrap_id, leads):
-    if not scrap_id:return
-    with db() as conn:
-        sid=uuid.UUID(scrap_id)
-        for lead in leads:
-            data=lead.model_dump(mode="json") if hasattr(lead,"model_dump") else dict(lead)
-            existing=conn.execute("SELECT id FROM leads WHERE scrap_id=%s AND lower(data->>'email')=lower(%s) LIMIT 1",(sid,str(data.get("email") or ""))).fetchone()
-            lead_id=existing[0] if existing else uuid.uuid4()
-            if not existing:
-                conn.execute("INSERT INTO leads(id,scrap_id,data) VALUES(%s,%s,%s)",(lead_id,sid,Jsonb(data)))
-            source_url=str(data.get("source_url") or "")
-            if source_url:
-                for (evidence_id,) in conn.execute("SELECT id FROM evidence WHERE scrap_id=%s AND data->>'url'=%s",(sid,source_url)).fetchall():
-                    conn.execute("INSERT INTO lead_sources(lead_id,evidence_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",(lead_id,evidence_id))
-        conn.commit()
+    if not scrap_id:
+        return
+    for lead in leads:
+        persist_lead(scrap_id, lead)
+
+def _run_enrich_job(job_id, scrap_id, lead_id):
+    try:
+        sid = uuid.UUID(scrap_id)
+        lid = uuid.UUID(lead_id)
+        with db() as conn:
+            row = conn.execute(
+                "SELECT s.user_id,s.criteria,s.crawler_config,l.data "
+                "FROM scraps s JOIN leads l ON l.scrap_id=s.id "
+                "WHERE s.id=%s AND l.id=%s",
+                (sid, lid),
+            ).fetchone()
+        if not row:
+            raise RuntimeError("Lead or Scrap not found")
+        user_id, raw_criteria, raw_crawler, data = row
+        lead = Lead.model_construct(**(data or {}))
+        if not str(getattr(lead, "source_url", "") or "").strip():
+            raise RuntimeError("Lead has no source_url to enrich")
+        criteria = SearchCriteria.model_validate(raw_criteria or {})
+        crawler = CrawlerConfig.model_validate(raw_crawler or {})
+        prefixes, rules = get_client_policies(str(user_id))
+        JOBS[job_id] = {
+            "job_id": job_id, "status": "running", "stage": "Starting",
+            "message": "Lead enrichment started", "counts": {}, "events": [],
+            "lead_count": 0,
+        }
+        _persist_job(job_id, status="running", stage="Starting", result={"message": "Lead enrichment started"})
+        sink = JobEventSink(_event_callback(job_id))
+        leads = asyncio.run(
+            LeadDiscoveryPipeline(
+                crawler_config=crawler,
+                generic_prefixes=prefixes,
+                domain_rules=rules,
+                llm_call_counter=lambda: _increment_llm_calls(scrap_id),
+            ).enrich_lead(
+                criteria,
+                lead,
+                event_sink=sink,
+                scrap_id=scrap_id,
+                cancel_check=lambda: job_id in CANCEL_FLAGS,
+            )
+        )
+        snapshot = JOBS[job_id]
+        JOBS[job_id].update(status="completed", lead_count=len(leads), output=None)
+        _persist_job(
+            job_id,
+            status="completed",
+            stage="Complete",
+            result={
+                "lead_count": len(leads),
+                "counts": snapshot.get("counts", {}),
+                "events": snapshot.get("events", []),
+                "message": "Lead enrichment completed",
+            },
+        )
+    except Exception as exc:
+        JOBS.setdefault(job_id, {}).update(status="failed", message="Lead enrichment failed", error=str(exc))
+        snapshot = JOBS[job_id]
+        _persist_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            result={
+                "error": str(exc),
+                "message": "Lead enrichment failed",
+                "counts": snapshot.get("counts", {}),
+                "events": snapshot.get("events", []),
+            },
+        )
+
 
 def _run_url_job(job_id,request):
     try:

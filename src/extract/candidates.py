@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from src.extract.email import is_personal_email
+from src.models.lead import has_person_specific_evidence
 
 
 @dataclass
@@ -54,4 +54,10 @@ class CandidateBuilder:
 
     @staticmethod
     def is_valid_lead(candidate: Candidate, generic_prefixes: set[str] | None = None) -> bool:
-        return bool(candidate.email and is_personal_email(candidate.email, generic_prefixes))
+        if not has_person_specific_evidence(candidate):
+            return False
+        if candidate.email:
+            from src.extract.email import is_personal_email
+            if not is_personal_email(candidate.email, generic_prefixes):
+                return False
+        return True

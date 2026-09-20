@@ -48,6 +48,7 @@ chrome.runtime.onMessage.addListener((message,sender,sendResponse)=>{
  if(message?.type==='auth_clear'){(async()=>{await clearAuth();await stopAuto('Logged out.');sendResponse({ok:true});})().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
  if(message?.type==='auth_validate'){(async()=>sendResponse(await validateAuth()))().catch(e=>sendResponse({ok:false,error:String(e)}));return true;} if(message?.type==='auto_start'){(async()=>sendResponse(await startAuto(message.tabId)))().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
  if(message?.type==='auto_stop'){(async()=>{await stopAuto('Auto collection stopped.');sendResponse({ok:true});})().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
+ if(message?.type==='auto_clear'){(async()=>{await stopAuto('Local SERP preview cleared.');await chrome.storage.local.remove([KEY,PAGE_KEY,AUTO_KEY]);await chrome.action.setBadgeText({text:''});sendResponse({ok:true});})().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
  if(message?.type==='auto_resume'){(async()=>{const s=await readAuto();if(!s?.running)return sendResponse({ok:false,error:'Auto collection is not running.'});s.waitingChallenge=false;await writeAuto(s);chrome.alarms.create(ALARM,{delayInMinutes:0.01});sendResponse({ok:true});})().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
  if(message?.type==='auto_state'){(async()=>sendResponse({ok:true,state:await readAuto()}))().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
  if(message?.type==='serp_results'){
@@ -86,9 +87,12 @@ async function autoStep(){
  if(!result?.ok){if(result?.challenge){state.waitingChallenge=true;state.message='CAPTCHA/challenge detected — solve it in the browser, then click RESUME.';await writeAuto(state);return;}throw new Error(result?.error||'SERP capture failed.');} if(!result.results?.length)return stopAuto('No organic SERP results detected; collection finished.');
  if(result.pageKey===state.lastPageKey)return stopAuto('SERP page did not change; collection stopped to prevent a loop.');
  const tagged=result.results.map((r,i)=>({...r,capture_id:`${Date.now()}-${state.pages}-${i}`,captured_at:new Date().toISOString()}));
- let synced=0;
- for(let i=0;i<tagged.length;i+=25){const chunk=tagged.slice(i,i+25);await api('/serp/import',{method:'POST',body:JSON.stringify({token:state.token,urls:[],results:chunk,page_url:tab.url})});synced+=chunk.length;}
- state.pages+=1;state.results+=synced;state.lastPageKey=result.pageKey;state.message=`Page ${state.pages}: captured ${synced} results. Total ${state.results}.`;
+ let synced=0; const uniqueAdded=[];
+ for(let i=0;i<tagged.length;i+=25){const chunk=tagged.slice(i,i+25);const imported=await api('/serp/import',{method:'POST',body:JSON.stringify({token:state.token,urls:[],results:chunk,page_url:tab.url})});const fresh=Number(imported?.new_results||0);synced+=fresh;}
+ const local=await readResults(); const seen=new Set(local.map(x=>x.url).filter(Boolean));
+ for(const item of tagged){if(!item.url||seen.has(item.url))continue;seen.add(item.url);uniqueAdded.push(item);}
+ const unique=local.concat(uniqueAdded).slice(-10000); await chrome.storage.local.set({[KEY]:unique});
+ state.pages+=1;state.results=unique.length;state.lastPageKey=result.pageKey;state.message=`Page ${state.pages}: captured ${uniqueAdded.length} new unique results. Total ${state.results}.`;
  await writeAuto(state);await chrome.action.setBadgeText({text:String(Math.min(state.results,9999))});
  if(result.challengeNext){state.waitingChallenge=true;state.message='CAPTCHA/challenge detected after capture — solve it in the browser, then click RESUME.';await writeAuto(state);return;}
  if(!result.nextHref)return stopAuto(`Collection finished: ${state.pages} SERP pages, ${state.results} results.`);

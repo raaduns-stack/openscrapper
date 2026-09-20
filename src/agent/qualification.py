@@ -41,23 +41,24 @@ class LeadQualifier:
                 score += 2.0
                 reasons.append(f"role:{role}")
 
-        # Source of truth: a verified personal email alone is sufficient to
-        # accept a Lead; semantic keyword matching is enrichment, not a gate.
+        # Source of truth: acceptance is based on person identity plus
+        # person-specific supporting evidence. Personal email is optional.
+        from src.models.lead import has_person_specific_evidence
+
         if lead.email:
             score += 1.0
             reasons.append("personal_email")
+
+        if has_person_specific_evidence(lead):
+            reasons.append("person_specific_evidence")
             return QualificationResult(
                 relevant=True,
                 score=score,
                 reasons=tuple(reasons),
             )
 
-        has_semantic_match = any(
-            reason.startswith(("matched:", "role:"))
-            for reason in reasons
-        )
         return QualificationResult(
-            relevant=has_semantic_match,
+            relevant=False,
             score=score,
             reasons=tuple(reasons),
         )
