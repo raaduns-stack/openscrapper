@@ -415,6 +415,25 @@ def complete_submission(scrap_id: str, req: Request):
         conn.execute("UPDATE scraps SET status='submitted',completed_at=now() WHERE id=%s",(sid,)); conn.commit()
     return {"scrap_id":scrap_id,"status":"submitted"}
 
+@app.post("/scraps/{scrap_id}/cancel")
+def cancel_scrap(scrap_id: str, req: Request):
+    user=current_user(req); sid=uuid.UUID(scrap_id); uid=uuid.UUID(user["id"])
+    canceled_jobs=[]
+    with db() as conn:
+        row=conn.execute("SELECT status FROM scraps WHERE id=%s AND user_id=%s FOR UPDATE",(sid,uid)).fetchone()
+        if not row: raise HTTPException(404,"Scrap not found")
+        if row[0] == "canceled": return {"scrap_id":scrap_id,"status":"canceled"}
+        if row[0] not in ("active","running"): raise HTTPException(409,"Only an active Current Scrap can be canceled")
+        jobs=conn.execute("SELECT id FROM jobs WHERE scrap_id=%s AND status IN ('queued','running')",(sid,)).fetchall()
+        for (jid,) in jobs:
+            CANCEL_FLAGS.add(str(jid)); canceled_jobs.append(str(jid))
+            conn.execute("UPDATE jobs SET status='canceled',stage='Canceled',result=result || %s,updated_at=now() WHERE id=%s",(Jsonb({"message":"Scrap canceled by user"}),jid))
+        conn.execute("UPDATE scraps SET status='canceled',completed_at=now() WHERE id=%s",(sid,))
+        conn.execute("DELETE FROM serp_sessions WHERE scrap_id=%s",(sid,))
+        conn.commit()
+    return {"scrap_id":scrap_id,"status":"canceled","canceled_jobs":canceled_jobs}
+
+
 @app.post("/scraps/{scrap_id}/reopen")
 def reopen_scrap(scrap_id: str, req: Request):
     user=current_user(req); sid=uuid.UUID(scrap_id); uid=uuid.UUID(user["id"])
@@ -640,8 +659,9 @@ def sync_serp(request: SerpSyncRequest, req: Request):
     if not scrap_id:
         scrap_id=current_scrap(req)["id"]
     with db() as conn:
-        owned=conn.execute("SELECT 1 FROM scraps WHERE id=%s AND user_id=%s",(uuid.UUID(scrap_id),uuid.UUID(user["id"]))).fetchone()
+        owned=conn.execute("SELECT status FROM scraps WHERE id=%s AND user_id=%s",(uuid.UUID(scrap_id),uuid.UUID(user["id"]))).fetchone()
         if not owned: raise HTTPException(403,"Scrap does not belong to this user")
+        if owned[0] not in ("active","running"): raise HTTPException(409,"Scrap is no longer active")
         limit=_serp_limit(conn)
         conn.execute("SELECT id FROM scraps WHERE id=%s FOR UPDATE",(uuid.UUID(scrap_id),))
         used=conn.execute("SELECT count(*) FROM serp_results WHERE scrap_id=%s",(uuid.UUID(scrap_id),)).fetchone()[0]

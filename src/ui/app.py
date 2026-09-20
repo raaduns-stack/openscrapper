@@ -357,6 +357,16 @@ elif page=='Current Scrap':
             st.info("No qualified leads captured from SERP yet. Leads will appear here as SERP processing validates and saves them.")
         if live['status'] in ('active','running'):
             st.subheader('3. Finish URL submission')
+            st.caption('Cancel terminates this Current Scrap and releases the lock so you can create a new Scrap. Captured data remains in Scrap History.')
+            if st.button('CANCEL CURRENT SCRAP',use_container_width=True,key='cancel-current-scrap'):
+                try:
+                    r=api('POST',f"/scraps/{st.session_state.scrap_id}/cancel"); r.raise_for_status()
+                    st.session_state.scrap_id=None; st.session_state.serp_token=None; st.session_state.parameters=[]; st.session_state.selected=[]; st.session_state.job=None; st.session_state.manual_sources=[]
+                    st.success('Current Scrap canceled. You can now create a new Scrap.')
+                    st.session_state.nav_page='New Scrap'; st.rerun()
+                except Exception as exc: st.error(f'Could not cancel Current Scrap: {exc}')
+            st.divider()
+            st.subheader('4. Finish URL submission')
             st.caption('When you have finished browsing and collecting results, click the button below. This ends the active collection phase and releases the Current Scrap lock.')
             if current_urls:
                 if st.button('URL SUBMISSION COMPLETED',type='primary',use_container_width=True):
