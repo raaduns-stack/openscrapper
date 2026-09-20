@@ -5,26 +5,41 @@
 - SearchCriteria
 - QueryExpander
 - Geography
-- DiscoveryController / DiscoveryAgent
-- Search aggregation and DuckDuckGo provider
-- Relevance scoring
+- DiscoveryController / DiscoveryAgent foundation (legacy/internal discovery path)
+- Search aggregation and DuckDuckGo provider foundation
+- Relevance scoring foundation
 - OpenClaw adapter foundation
 - Basic pagination
 - Adaptive deterministic extraction
 - JSON-LD and HTML extraction
 - Individual Lead Pydantic contract
-- Qualification
-- Deduplication
+- Evidence-based qualification with optional personal email
+- Authoritative lead dedupe/persistence path
 - CSV and Excel export
 - API/UI foundations
+- Browser extension SERP capture integration for the current product workflow
+- Controlled Scrapy enrichment path with crawl/time/lead bounds
+
+## Current architecture commitments
+
+- SERP capture is the primary research discovery input.
+- All captured SERP URLs are submitted when Start Research is clicked.
+- Lead qualification is evidence-based and does not require a personal email.
+- SERP and Scrapy share the same qualification contract.
+- Scrapy may discover additional qualifying people during controlled enrichment.
+- Scrapy crawling is bounded by depth, page/URL, time, domain, and relevant-link policy.
+- One authoritative dedupe/persistence path handles lead creation and updates.
+- The Leads widget exposes per-lead Enrich actions using the same enrichment engine as batch research.
+- CRM synchronization remains outside MVP scope.
 
 ## V1.2 remaining work
 
 ### P0 — Collection architecture
 
-1. Make Scrapy/HTTP the primary collection engine.
-2. Integrate scrapy-playwright for JS-required pages.
-3. Establish the evidence/content abstraction as the collection boundary.
+1. Keep the browser extension as the primary Google/Bing SERP discovery/capture path.
+2. Complete Scrapy/HTTP as the primary post-capture collection/enrichment engine.
+3. Integrate scrapy-playwright for JS-required pages.
+4. Establish the evidence/content abstraction as the collection boundary.
 
 ### P1 — Extraction and research
 
@@ -49,6 +64,7 @@ detection, stopping conditions, and failure handling.
 ## Definition of V1.2 complete
 
 V1.2 is complete only when the canonical pipeline is executable end-to-end from customer
-criteria through discovery, collection, evidence, extraction/research, conditional
-browser escalation, qualification, validation/self-correction, dedupe, and all target
-exports, with automated tests covering the important decision boundaries.
+criteria through browser-based Google/Bing SERP discovery/capture, controlled collection,
+evidence, extraction/research, conditional browser escalation, qualification, validation/
+self-correction, dedupe, and all target exports, with automated tests covering the important
+decision boundaries.

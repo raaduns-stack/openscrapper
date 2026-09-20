@@ -285,7 +285,7 @@ elif page=='Current Scrap':
         if st.button('↻ Refresh Current Scrap',key='refresh-current'):
             st.rerun()
         st.info('Work on this Scrap until you have finished collecting Google/Bing results. Your collection is saved to Scrappee as it arrives.')
-        a,b,c,d=st.columns(4);a.metric('SERP results',live['counts']['serp_results']);b.metric('URL occurrences',live['counts']['url_occurrences']);c.metric('Leads',live['counts']['leads']);d.metric('SERP capacity',f"{live['counts']['serp_results']} / {live['serp_limit']}")
+        a,b,c,d,e=st.columns(5);a.metric('SERP results',live['counts']['serp_results']);b.metric('URL occurrences',live['counts']['url_occurrences']);c.metric('Leads',live['counts']['leads']);d.metric('LLM calls',live['counts'].get('llm_calls',0));e.metric('SERP capacity',f"{live['counts']['serp_results']} / {live['serp_limit']}")
         if live['counts']['serp_results'] >= live['serp_limit']: st.warning('SERP capacity reached. Further SERP imports are blocked until this Scrap is closed.')
         research_running = live['status']=='running' and current_job and current_job.get('status') in ('queued','running')
         if research_running:
@@ -340,6 +340,21 @@ elif page=='Current Scrap':
             st.info('No SERP results have been saved yet. Open a Google/Bing search and use the extension to capture results.')
         if current_results:
             st.dataframe(current_results[:5000],use_container_width=True,hide_index=True)
+        captured_leads=api_json("GET",f"/scraps/{st.session_state.scrap_id}/results")
+        st.subheader("SERP leads captured")
+        if captured_leads:
+            st.success("{} lead(s) have been captured and saved. Scrapy will enrich these records after URL submission.".format(len(captured_leads)))
+            captured_leads_data = [r["data"] for r in captured_leads]
+            st.download_button(
+                "Download captured leads CSV",
+                data=__import__("pandas").DataFrame(captured_leads_data).to_csv(index=False).encode("utf-8"),
+                file_name=f"serp-leads-{st.session_state.scrap_id}.csv",
+                mime="text/csv",
+                key="download-captured-leads-csv",
+            )
+            st.dataframe(captured_leads_data,use_container_width=True,hide_index=True)
+        else:
+            st.info("No qualified leads captured from SERP yet. Leads will appear here as SERP processing validates and saves them.")
         if live['status'] in ('active','running'):
             st.subheader('3. Finish URL submission')
             st.caption('When you have finished browsing and collecting results, click the button below. This ends the active collection phase and releases the Current Scrap lock.')

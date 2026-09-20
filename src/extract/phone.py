@@ -1,6 +1,16 @@
 import phonenumbers
 
 
+def extract_phone(value: str | None, default_region: str | None = None) -> str | None:
+    if not value:
+        return None
+    for match in phonenumbers.PhoneNumberMatcher(value, default_region):
+        candidate = phonenumbers.format_number(match.number, phonenumbers.PhoneNumberFormat.E164)
+        if phonenumbers.is_possible_number(match.number) and phonenumbers.is_valid_number(match.number):
+            return candidate
+    return None
+
+
 def normalize_phone(value: str | None, default_region: str | None = None) -> str | None:
     if not value:
         return None

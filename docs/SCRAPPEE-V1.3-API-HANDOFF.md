@@ -162,7 +162,7 @@ Request:
   "page_url": "https://www.google.com/search?q=..."
 }
 ```
-Server enforces the configured per-Scrap SERP capacity. **No URL deduplication is performed.**
+Server enforces the configured per-Scrap SERP capacity. Exact duplicate destination URLs are deduplicated within a Scrap before crawl submission; distinct destination paths remain independent.
 
 ### POST `/serp/sync`
 Compatibility synchronization endpoint for authenticated extension flow. Uses `X-Scrap-Id` when supplied; otherwise resolves Current Scrap. Server enforces SERP capacity.
