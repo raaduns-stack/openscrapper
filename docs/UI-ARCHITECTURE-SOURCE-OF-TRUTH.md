@@ -174,3 +174,12 @@ Authorization is enforced server-side. UI visibility is an additional usability 
 This document does not authorize a release.
 
 All implementation commits remain local by default. No push or merge to stable/main is permitted without an explicit CTO command.
+
+## 12. Engineering Agent Operating Model
+
+1. **CTO** = final authority for architecture, approval, push, merge, and release.
+2. **Lead Engineer** = architecture, implementation planning, source-of-truth compliance, review, validation, and regression analysis.
+3. **Antigravity** = hands-on implementation agent responsible for filesystem edits, local commands, tests, validation, and local commits only when explicitly instructed.
+4. Antigravity MUST NOT git push, merge, rebase stable/main, reset/clean the working tree, or modify unrelated existing changes without explicit CTO authorization.
+5. All implementation remains local until the CTO explicitly authorizes publication/release.
+6. Existing unrelated working-tree changes must be preserved.
