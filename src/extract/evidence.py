@@ -2,6 +2,7 @@ import re
 from bs4 import BeautifulSoup
 import trafilatura
 from src.models.evidence import FieldEvidence, PageEvidence
+from src.extract.email import normalize_extracted_email
 
 
 EMAIL_RE = re.compile(
@@ -46,7 +47,10 @@ class EvidenceBuilder:
         fields: list[FieldEvidence] = []
 
         for match in EMAIL_RE.finditer(visible):
-            value = match.group(0).lower()
+            value = normalize_extracted_email(match.group(0), visible)
+            if not value:
+                continue
+            value = value.lower()
             start = max(0, match.start() - 120)
             end = min(len(visible), match.end() + 120)
 

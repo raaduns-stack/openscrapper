@@ -132,6 +132,7 @@ def import_payload():
 
 if not st.session_state.token: restore_web_session()
 if not st.session_state.token:
+    st.markdown("<style>section[data-testid='stSidebar']{display:none!important;}[data-testid='collapsedControl']{display:none!important;}</style>", unsafe_allow_html=True)
     st.title('Scrappee');st.caption('Lead research workspace')
     tab1,tab2=st.tabs(['Sign in','Create account'])
     with tab1:

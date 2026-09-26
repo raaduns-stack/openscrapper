@@ -1,8 +1,6 @@
-import requests
 import streamlit as st
 
 def render_client_policies(api, api_json, api_error, **kwargs):
-    with admin_tabs[4]:
         st.subheader('Client Policies')
         st.caption('Client-specific Generic Mailbox Prefixes and Domain Rules.')
         st.subheader('Generic Mailbox Prefixes')

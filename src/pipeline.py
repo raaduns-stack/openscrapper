@@ -1,10 +1,15 @@
 import asyncio
+import os
+import json
+import re
 
 from src.agent.discovery import DiscoveryAgent
+from src.agent.geography import GeographyResolver
 from src.agent.qualification import LeadQualifier
 from src.collector.scrapy_runner import ScrapyCollector
-from src.dedupe.leads import dedupe, persist_lead
+from src.dedupe.leads import dedupe, persist_lead, enrichment_identity_keys
 from src.extract.adaptive import AdaptiveLeadExtractor
+from src.extract.contextual import ContextualLeadExtractor
 from src.extract.evidence import EvidenceBuilder
 from src.extract.documents import is_document_url, extract_document_text
 from src.extract.phone import extract_phone
@@ -15,10 +20,32 @@ from src.exports.csv_export import export_csv
 from src.exports.google_sheets import export_google_sheets
 from src.exports.xlsx_export import export_xlsx
 from src.models.criteria import CrawlerConfig, SearchCriteria
-from src.models.lead import Lead
+from src.models.lead import Lead, is_protected_lead_field
 from pydantic import ValidationError
 from src.policy import domain_matches
 from src.observability.job_events import JobEvent, emit_event, NullJobEventSink
+from src.enrichment.paid import llm_candidates
+from src.enrichment.firecrawl import FirecrawlEnricher
+
+_GEOGRAPHY = GeographyResolver()
+_ENRICHMENT_FIELDS = (
+    "first_name", "last_name", "position", "company_name", "country",
+    "city", "state", "email", "phone", "website",
+)
+_ARTIFACT_TERMS = (
+    "email list", "email database", "verified contacts", "contact database",
+    "mailing list", "phone number list", "contact list",
+)
+
+def _is_enrichment_artifact(field, value) -> bool:
+    if value in (None, ""):
+        return False
+    text = str(value).strip().casefold()
+    if field in {"first_name", "last_name"}:
+        return any(term in text for term in ("email", "phone", "contact", "database", "list"))
+    if field in {"position", "company_name"}:
+        return any(term in text for term in _ARTIFACT_TERMS) or "@" in text or text.startswith(("http://", "https://"))
+    return False
 
 
 def _persist_evidence(scrap_id, evidence):
@@ -45,6 +72,109 @@ def _persist_lead(scrap_id, lead: Lead, evidence_id=None) -> bool:
     return persist_lead(scrap_id, lead, evidence_id=evidence_id)
 
 
+def _same_enrichment_person(existing: Lead, incoming: Lead) -> bool:
+    # Paid Enrichment searches other sources. source_url is provenance only and
+    # must never be required for cross-source identity resolution.
+    existing_keys = set(enrichment_identity_keys(existing))
+    incoming_keys = set(enrichment_identity_keys(incoming))
+    return bool(existing_keys.intersection(incoming_keys))
+
+
+def _enrichment_identity_relation(seed: Lead, candidate: Lead) -> str:
+    """Classify an enrichment candidate against the selected Lead without name-only matching."""
+    if _same_enrichment_person(seed, candidate):
+        return "MATCH"
+    first = _norm_evidence_text(seed.first_name)
+    last = _norm_evidence_text(seed.last_name)
+    c_first = _norm_evidence_text(candidate.first_name)
+    c_last = _norm_evidence_text(candidate.last_name)
+    same_name = bool(first and last and first == c_first and last == c_last)
+    if not same_name:
+        return "UNKNOWN"
+    seed_company = _norm_evidence_text(seed.company_name)
+    cand_company = _norm_evidence_text(candidate.company_name)
+    seed_geo = {_norm_evidence_text(seed.state), _norm_evidence_text(seed.country)} - {""}
+    cand_geo = {_norm_evidence_text(candidate.state), _norm_evidence_text(candidate.country)} - {""}
+    if seed_company and cand_company and seed_company != cand_company:
+        return "SAME_NAME_DIFFERENT_PERSON"
+    seed_state = _norm_evidence_text(seed.state)
+    cand_state = _norm_evidence_text(candidate.state)
+    seed_country = _norm_evidence_text(seed.country)
+    cand_country = _norm_evidence_text(candidate.country)
+    if seed_state and cand_state and seed_state != cand_state:
+        return "SAME_NAME_DIFFERENT_PERSON"
+    if seed_country and cand_country and seed_country != cand_country:
+        return "SAME_NAME_DIFFERENT_PERSON"
+    return "UNKNOWN"
+
+def _norm_evidence_text(value):
+    return re.sub(r"\s+", " ", str(value or "").casefold()).strip()
+
+
+def _norm_phone(value):
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _norm_url(value):
+    value = str(value or "").strip().casefold()
+    return value.rstrip("/")
+
+
+def _field_supported_by_pages(field: str, value, pages: list[dict], lead: Lead):
+    if value in (None, ""):
+        return None
+    target = _norm_evidence_text(value)
+    for page in pages or []:
+        if page.get("status") not in (None, 200):
+            continue
+        if field == "email" and not lead.email and page.get("linkedin_source"):
+            continue
+        text = _norm_evidence_text(page.get("markdown") or page.get("text") or "")
+        if not text:
+            continue
+        supported = False
+        if field == "phone":
+            digits = _norm_phone(value)
+            supported = bool(digits and digits in _norm_phone(text))
+        elif field in {"website", "source_url"}:
+            supported = target in text or target.removeprefix("https://").removeprefix("http://") in text
+        elif field == "email":
+            supported = target in text
+        else:
+            identity = _norm_evidence_text(f"{lead.first_name or ''} {lead.last_name or ''}")
+            supported = target in text and (not identity or identity in text)
+        if supported:
+            return page.get("url")
+    return None
+
+
+def _merge_enrichment(existing: Lead, incoming: Lead, generic_prefixes=None, evidence_pages=None, event_sink=None) -> Lead:
+    data = existing.model_dump(mode="python")
+    pages = evidence_pages or []
+    for field in _ENRICHMENT_FIELDS:
+        incoming_value = getattr(incoming, field)
+        existing_value = data.get(field)
+        if is_protected_lead_field(field):
+            if incoming_value not in (None, "") and incoming_value != existing_value and event_sink:
+                emit_event(event_sink, "Enrichment", "Rejected protected enrichment field", field=field, reason="protected_field")
+            continue
+        if incoming_value in (None, "") or incoming_value == existing_value:
+            continue
+        evidence_url = _field_supported_by_pages(field, incoming_value, pages, existing)
+        if not evidence_url:
+            if event_sink:
+                emit_event(event_sink, "Enrichment", "Rejected unsupported enrichment field", field=field, value=str(incoming_value), reason="no_direct_page_evidence")
+            continue
+        action = "FILL" if existing_value in (None, "") or _is_enrichment_artifact(field, existing_value) else "CORRECT"
+        data[field] = incoming_value
+        if event_sink:
+            emit_event(event_sink, "Enrichment", f"Accepted evidence-backed {action}", field=field, before=existing_value, after=incoming_value, evidence_url=evidence_url, reason="direct_page_evidence")
+    data["source_url"] = existing.source_url
+    if existing.capture_stage != incoming.capture_stage:
+        data["capture_stage"] = "serp+scrapy"
+    return Lead.model_validate(data, context={"generic_prefixes": generic_prefixes})
+
+
 class LeadDiscoveryPipeline:
     def __init__(
         self,
@@ -66,6 +196,7 @@ class LeadDiscoveryPipeline:
         )
         self.extractor = AdaptiveLeadExtractor(model=model, generic_prefixes=generic_prefixes, llm_call_counter=llm_call_counter)
         self.serp_extractor = AdaptiveLeadExtractor(model=model, generic_prefixes=generic_prefixes, llm_call_counter=llm_call_counter)
+        self.contextual_serp_extractor = ContextualLeadExtractor(generic_prefixes=generic_prefixes) if os.getenv("CLAW_CONTEXTUAL_EXTRACTION", "1").casefold() not in {"0", "false", "no"} else None
         self.qualifier = LeadQualifier()
         self.evidence = EvidenceBuilder()
 
@@ -86,10 +217,16 @@ class LeadDiscoveryPipeline:
             with _db() as conn:
                 persisted_total = int(conn.execute("SELECT count(*) FROM leads WHERE scrap_id=%s", (_uuid.UUID(str(scrap_id)),)).fetchone()[0])
 
-        def should_stop():
+        def should_cancel():
             nonlocal stop_reason
             if cancel_check and cancel_check():
                 stop_reason = "canceled"
+                return True
+            return False
+
+        def should_stop():
+            nonlocal stop_reason
+            if should_cancel():
                 return True
             if persisted_total >= criteria.max_leads:
                 stop_reason = "lead_limit"
@@ -129,7 +266,8 @@ class LeadDiscoveryPipeline:
                     progress_callback=scrapy_progress,
                     scrap_id=scrap_id,
                     page_callback=page_callback,
-                    cancel_check=should_stop,
+                    cancel_check=should_cancel,
+                    stop_check=should_stop,
                 )
             finally:
                 await page_queue.put(None)
@@ -228,7 +366,7 @@ class LeadDiscoveryPipeline:
         emit_event(sink, "Leads", "Lead set ready", state="complete", leads=len(final))
         return final
 
-    async def _stream_pages(self, urls, *, progress_callback=None, scrap_id=None, cancel_check=None, collector=None):
+    async def _stream_pages(self, urls, *, progress_callback=None, scrap_id=None, cancel_check=None, stop_check=None, collector=None):
         collector = collector or self.collector
         page_queue: asyncio.Queue[CollectedPage | None] = asyncio.Queue(maxsize=16)
         loop = asyncio.get_running_loop()
@@ -245,6 +383,7 @@ class LeadDiscoveryPipeline:
                     scrap_id=scrap_id,
                     page_callback=page_callback,
                     cancel_check=cancel_check,
+                    stop_check=stop_check,
                 )
             finally:
                 await page_queue.put(None)
@@ -271,6 +410,14 @@ class LeadDiscoveryPipeline:
             return None
 
         email_match = _re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, _re.I)
+        if email_match:
+            from src.extract.email import normalize_extracted_email
+            normalized_email = normalize_extracted_email(email_match.group(0), text)
+            if normalized_email:
+                class _EmailMatch:
+                    def group(self, _index=0):
+                        return normalized_email
+                email_match = _EmailMatch()
         phone_value = extract_phone(text, None)
         position = None
         company_name = None
@@ -365,8 +512,58 @@ class LeadDiscoveryPipeline:
             state = location_match.group(2).strip().upper()
             country = location_match.group(3).strip()
             country = {"us": "United States", "usa": "United States", "uk": "United Kingdom"}.get(country.casefold(), country)
+        else:
+            # LinkedIn SERP snippets commonly expose "City, State, Country" without
+            # the phrase "based in". Keep this deterministic and limited to known
+            # country names so arbitrary comma-separated text is not promoted.
+            location_match = _re.search(
+                r"\b([^,.;]+),\s*([^,.;]+),\s*(United States|USA|US|United Kingdom|UK|Canada|Australia|India|South Africa)\b",
+                evidence_text, _re.I,
+            )
+            if location_match:
+                city = location_match.group(1).strip()
+                state = location_match.group(2).strip()
+                country = location_match.group(3).strip()
+                country = {"us": "United States", "usa": "United States", "uk": "United Kingdom"}.get(country.casefold(), country)
+            else:
+                # LinkedIn snippets also use a compact "Country · Company" form.
+                country_match = _re.search(
+                    r"(?:^|[·|•])\s*(United States|USA|US|United Kingdom|UK|Canada|Australia|India|South Africa)\b",
+                    evidence_text, _re.I,
+                )
+                if country_match:
+                    country = country_match.group(1).strip()
+                    country = {"us": "United States", "usa": "United States", "uk": "United Kingdom"}.get(country.casefold(), country)
+
+        # Validate/canonicalize extracted location against the bundled geography hierarchy.
+        geo = _GEOGRAPHY.classify(city=city, state=state, country=country)
+        city, state, country = geo["city"], geo["state"], geo["country"]
+
+        # Personal email is a complete acceptance path; keep that acceptance while
+        # continuing location extraction so country/city/state are not discarded.
+        personal_email = False
+        if email_match:
+            from src.extract.email import is_personal_email
+            personal_email = is_personal_email(email_match.group(0), None)
+
+        explicit_person_cue = bool(
+            is_linkedin_person or is_author_page or is_facebook_person
+            or email_match or phone_value
+            or _re.search(r"\b(?:is|was|works as|worked as|currently|based in|contact)\b", evidence_text, _re.I)
+        )
+        if not explicit_person_cue:
+            return None
 
         if not name_part:
+            if personal_email:
+                return {
+                    "email": email_match.group(0),
+                    "city": city,
+                    "state": state,
+                    "country": country,
+                    "source_url": source_url,
+                    "capture_stage": "serp",
+                }
             return None
         name_words = name_part.split()
         if not 2 <= len(name_words) <= 5:
@@ -410,7 +607,7 @@ class LeadDiscoveryPipeline:
     async def process_serp_records(self, criteria: SearchCriteria, results, event_sink=None, scrap_id=None, cancel_check=None) -> list[Lead]:
         """Extract and persist leads from SERP title/snippet evidence without crawling destination URLs."""
         sink = event_sink or NullJobEventSink()
-        records = [r if isinstance(r, dict) else r.model_dump() for r in results]
+        records = [r if isinstance(r, dict) else r.model_dump(mode="json") for r in results]
         leads: list[Lead] = []
         extracted_total = qualified_total = persisted_total = 0
         for index, record in enumerate(records, start=1):
@@ -426,14 +623,41 @@ class LeadDiscoveryPipeline:
             text = f"{title}\n{snippet}\n{raw_text}".strip()
             evidence = self.evidence.build(url=url, html=html, text=text, status=200, rendered=True, source="serp-snippet")
             evidence_id = _persist_evidence(scrap_id, evidence)
-            extracted = []
+            extracted: list[Lead] = []
+            # Option B: deterministic extraction discovers the candidate first; GLiNER-Relex
+            # only enriches that candidate. The final merged record is always Lead-validated.
             payload = self._serp_payload(record, url)
             if payload:
                 try:
                     extracted = [Lead.model_validate(payload, context={"generic_prefixes": self.generic_prefixes})]
+                    emit_event(sink, "Leads", "Deterministic SERP candidate extracted", source_url=url)
                 except (ValidationError, TypeError, ValueError):
                     extracted = []
-            # SERP master records are deterministic evidence. Never invoke the LLM here.
+
+            if extracted and self.contextual_serp_extractor is not None:
+                try:
+                    contextual = await asyncio.to_thread(self.contextual_serp_extractor.extract, record, url)
+                    if contextual is not None:
+                        base = extracted[0]
+                        updates = {}
+                        for field in ("first_name", "last_name", "position", "company_name", "city", "state", "country", "phone", "website"):
+                            if getattr(base, field) is None and getattr(contextual, field) is not None:
+                                updates[field] = getattr(contextual, field)
+                        if base.email is None and contextual.email is not None:
+                            updates["email"] = contextual.email
+                        if updates:
+                            try:
+                                merged = base.model_copy(update=updates)
+                                Lead.model_validate(merged.model_dump(), context={"generic_prefixes": self.generic_prefixes})
+                                extracted = [merged]
+                                emit_event(sink, "Leads", "Contextual SERP enrichment applied", source_url=url)
+                            except (ValidationError, TypeError, ValueError):
+                                pass
+                except Exception as exc:
+                    emit_event(sink, "Extraction", f"Contextual SERP enrichment failed: {type(exc).__name__}", source_url=url)
+
+            # No deterministic candidate means no contextual-only promotion. This prevents
+            # GLiNER title/category guesses from becoming accepted leads on their own.
             extracted = [lead.model_copy(update={"capture_stage":"serp"}) for lead in extracted]
             qualified = [lead for lead in extracted if self.qualifier.qualify(lead, criteria).relevant]
             extracted_total += len(extracted)
@@ -452,7 +676,7 @@ class LeadDiscoveryPipeline:
     async def run_harvested(self, criteria: SearchCriteria, results, event_sink=None, scrap_id=None, cancel_check=None) -> list[Lead]:
         """Process SERP result occurrences, including snippets as first-class evidence."""
         sink = event_sink or NullJobEventSink()
-        records = [r if isinstance(r, dict) else r.model_dump() for r in results]
+        records = [r if isinstance(r, dict) else r.model_dump(mode="json") for r in results]
         urls = [str(r.get("url", "")).strip() for r in records if r.get("url")]
         unique_urls = list(dict.fromkeys(urls))
         skipped_urls = 0
@@ -468,21 +692,24 @@ class LeadDiscoveryPipeline:
         emit_event(sink, "URLs", "Imported SERP result occurrences", urls_total=len(urls), urls_skipped=skipped_urls, snippets=sum(bool(r.get("snippet", "").strip()) for r in records))
         leads: list[Lead] = []
         extracted_total = qualified_total = persisted_total = extraction_failures = 0
-        if scrap_id:
-            import uuid as _uuid
-            from src.db import db as _db
-            with _db() as conn:
-                persisted_total = int(conn.execute("SELECT count(*) FROM leads WHERE scrap_id=%s", (_uuid.UUID(str(scrap_id)),)).fetchone()[0])
+        lead_candidates = 0
+        final_leads = 0
+        lead_evidence_ids: dict[str, object] = {}
         started_at = time.monotonic()
         timeout_seconds = self.crawler_config.max_duration_hours * 3600
         stop_reason = None
 
-        def should_stop_harvest():
+        def should_cancel_harvest():
             nonlocal stop_reason
             if cancel_check and cancel_check():
                 stop_reason = "canceled"
                 return True
-            if persisted_total >= criteria.max_leads:
+            return False
+
+        def should_stop_harvest():
+            if should_cancel_harvest():
+                return True
+            if final_leads >= criteria.max_leads:
                 stop_reason = "lead_limit"
                 return True
             if time.monotonic() - started_at >= timeout_seconds:
@@ -526,17 +753,37 @@ class LeadDiscoveryPipeline:
                 extracted = []
             qualified = [lead for lead in extracted if self.qualifier.qualify(lead, criteria).relevant]
             extracted_total += len(extracted); qualified_total += len(qualified)
-            persisted = 0
-            for lead in qualified:
-                if _persist_lead(scrap_id, lead, evidence_id=evidence_id):
-                    persisted += 1
-                    persisted_total += 1
             leads.extend(qualified)
-            emit_event(sink, "Leads", "SERP lead candidates processed", extracted=len(extracted), qualified=len(qualified), persisted=persisted, leads=len(leads), extracted_total=extracted_total, qualified_total=qualified_total, persisted_total=persisted_total)
+            for lead in qualified:
+                if evidence_id and lead.source_url:
+                    lead_evidence_ids[str(lead.source_url)] = evidence_id
+            lead_candidates = len(leads)
+            final_leads = len(dedupe(leads))
+            emit_event(sink, "Leads", "SERP lead candidates processed", extracted=len(extracted), qualified=len(qualified), persisted=0, leads=final_leads, lead_candidates=lead_candidates, extracted_total=extracted_total, qualified_total=qualified_total, persisted_total=persisted_total)
             if should_stop_harvest():
                 break
 
-        if urls:
+        if urls and stop_reason is None:
+            # Batch research must remain bounded even when legacy Scrap configs
+            # contain null crawl limits. Explicit configured limits are preserved.
+            harvest_config = self.crawler_config.model_copy(update={
+                "max_crawl_pages": self.crawler_config.max_crawl_pages or 100,
+                "max_crawl_urls": self.crawler_config.max_crawl_urls or 250,
+                "max_crawl_depth": self.crawler_config.max_crawl_depth if self.crawler_config.max_crawl_depth is not None else 5,
+            })
+            harvest_collector = ScrapyCollector(
+                max_pages=harvest_config.max_crawl_pages,
+                max_urls=harvest_config.max_crawl_urls,
+                max_depth=harvest_config.max_crawl_depth,
+            )
+            emit_event(
+                sink,
+                "Collection",
+                "Applying bounded Scrapy limits",
+                max_crawl_pages=harvest_config.max_crawl_pages,
+                max_crawl_urls=harvest_config.max_crawl_urls,
+                max_crawl_depth=harvest_config.max_crawl_depth,
+            )
             progress_callback = lambda event: emit_event(
                 sink,
                 "Collection",
@@ -554,7 +801,7 @@ class LeadDiscoveryPipeline:
             page_index = 0
             cancelled = False
             try:
-                async for page in self._stream_pages(urls, progress_callback=progress_callback, scrap_id=scrap_id, cancel_check=should_stop_harvest):
+                async for page in self._stream_pages(urls, progress_callback=progress_callback, scrap_id=scrap_id, cancel_check=should_cancel_harvest, stop_check=should_stop_harvest, collector=harvest_collector):
                     page_index += 1
                     if should_stop_harvest():
                         cancelled = stop_reason == "canceled"
@@ -591,14 +838,14 @@ class LeadDiscoveryPipeline:
                         extracted = []
                     qualified = [lead for lead in extracted if self.qualifier.qualify(lead, criteria).relevant]
                     extracted_total += len(extracted); qualified_total += len(qualified)
-                    persisted = 0
-                    for lead in qualified:
-                        if _persist_lead(scrap_id, lead, evidence_id=evidence_id):
-                            persisted += 1
-                    persisted_total += persisted
                     leads.extend(qualified)
+                    for lead in qualified:
+                        if evidence_id and lead.source_url:
+                            lead_evidence_ids[str(lead.source_url)] = evidence_id
+                    lead_candidates = len(leads)
+                    final_leads = len(dedupe(leads))
                     emit_event(sink, "Validation", f"Validated page {page_index}", page=page_index, extracted=len(extracted))
-                    emit_event(sink, "Leads", "Lead candidates processed", extracted=len(extracted), qualified=len(qualified), persisted=persisted, leads=len(leads), extracted_total=extracted_total, qualified_total=qualified_total, persisted_total=persisted_total)
+                    emit_event(sink, "Leads", "Lead candidates processed", extracted=len(extracted), qualified=len(qualified), persisted=0, leads=final_leads, lead_candidates=lead_candidates, extracted_total=extracted_total, qualified_total=qualified_total, persisted_total=persisted_total)
             except Exception as exc:
                 emit_event(sink, "Collection", "Collection failed", state="failed", urls_total=len(urls))
                 print(f"collection_error={exc}")
@@ -613,109 +860,189 @@ class LeadDiscoveryPipeline:
                 emit_event(sink, "Collection", "Collection complete", pages_collected=page_index, urls_total=len(urls))
 
         final = dedupe(leads)[:criteria.max_leads]
-        emit_event(sink, "Qualification/Deduplication", "Qualification and deduplication complete", input_leads=len(leads), leads=len(final))
-        emit_event(sink, "Leads", "Lead set ready", state="complete", leads=len(final))
+        persisted_total = 0
+        for lead in final:
+            evidence_id = lead_evidence_ids.get(str(lead.source_url)) if lead.source_url else None
+            if _persist_lead(scrap_id, lead, evidence_id=evidence_id):
+                persisted_total += 1
+        emit_event(sink, "Qualification/Deduplication", "Qualification and deduplication complete", input_leads=len(leads), lead_candidates=len(leads), leads=len(final), persisted=persisted_total, persisted_total=persisted_total)
+        emit_event(sink, "Leads", "Lead set ready", state="complete", leads=len(final), lead_candidates=len(leads), persisted=persisted_total, persisted_total=persisted_total)
         return final
 
-    async def enrich_lead(self, criteria: SearchCriteria, lead: Lead, event_sink=None, scrap_id=None, cancel_check=None) -> list[Lead]:
-        """Enrich one persisted lead through the same controlled Scrapy engine."""
+    async def enrich_lead(self, criteria: SearchCriteria, lead: Lead, event_sink=None, scrap_id=None, cancel_check=None, firecrawl_data=None, persist_leads=True, persist_search_evidence=True, evidence_ids_out=None) -> list[Lead]:
+        """Enrich one persisted lead with Firecrawl Search + Scrape."""
         sink = event_sink or NullJobEventSink()
-        source_url = str(lead.source_url).strip()
-        website = str(lead.website).strip() if lead.website else ""
-        seed_urls = []
-        for candidate in (source_url, website):
-            if not candidate or candidate in seed_urls:
-                continue
-            parsed = urlparse(candidate)
-            if parsed.scheme in {"http", "https"} and parsed.netloc:
-                seed_urls.append(candidate)
-        if not seed_urls:
+        if cancel_check and cancel_check():
             return []
-        emit_event(sink, "URLs", "Enriching lead sources", urls_total=len(seed_urls), items=[{"url": url} for url in seed_urls])
-        started_at = time.monotonic()
-        timeout_seconds = self.crawler_config.max_duration_hours * 3600
-        stop_reason = None
 
-        def should_stop():
-            nonlocal stop_reason
-            if cancel_check and cancel_check():
-                stop_reason = "canceled"
-                return True
-            if time.monotonic() - started_at >= timeout_seconds:
-                stop_reason = "time_limit"
-                return True
-            return False
+        enricher = FirecrawlEnricher()
+        emit_event(sink, "Search", "Searching Firecrawl for enrichment sources")
+        search_items, pages = firecrawl_data or await asyncio.to_thread(enricher.collect, lead)
+        if search_items:
+            search_evidence = self.evidence.build(
+                url=search_items[0]["url"],
+                html="",
+                text="\n".join(
+                    f"{item['title']}\n{item['snippet']}\n{item['url']}"
+                    for item in search_items
+                ),
+                status=200,
+                rendered=False,
+                source="firecrawl_search",
+            )
+            if persist_search_evidence:
+                _persist_evidence(scrap_id, search_evidence)
+            emit_event(sink, "Evidence", "Firecrawl search evidence persisted", evidence=1, urls_total=len(search_items))
 
-        progress_callback = lambda event: emit_event(
-            sink, "Collection", event.get("message", "Scrapy progress"),
-            state=event.get("state", "running"),
-            urls_submitted=int(event.get("urls_submitted", len(seed_urls))),
-            pages_collected=int(event.get("pages_collected", 0)),
-            pages_failed=int(event.get("pages_failed", 0)),
-        )
-        # Enrichment must remain bounded even when legacy Scrap configs contain
-        # null crawl limits. Existing explicit limits are preserved.
-        enrichment_config = self.crawler_config.model_copy(update={
-            "max_crawl_pages": self.crawler_config.max_crawl_pages or 100,
-            "max_crawl_urls": self.crawler_config.max_crawl_urls or 250,
-            "max_crawl_depth": self.crawler_config.max_crawl_depth if self.crawler_config.max_crawl_depth is not None else 5,
-        })
-        enrichment_collector = ScrapyCollector(
-            max_pages=enrichment_config.max_crawl_pages,
-            max_urls=enrichment_config.max_crawl_urls,
-            max_depth=enrichment_config.max_crawl_depth,
-        )
         leads = []
-        async for page in self._stream_pages(
-            seed_urls,
-            progress_callback=progress_callback,
-            scrap_id=scrap_id,
-            cancel_check=should_stop,
-            collector=enrichment_collector,
-        ):
-            if should_stop() or page.error or page.status >= 400 or not _domain_allowed(page.url, self.domain_rules):
-                continue
-            if is_document_url(page.url, page.content_type):
-                try:
-                    page_text = extract_document_text(page.body, page.url, page.content_type)
-                except Exception:
-                    continue
-                if not page_text.strip():
-                    continue
-                html = f"<html><body><pre>{escape(page_text)}</pre></body></html>"
-            else:
-                if not page.html.strip():
-                    continue
-                html = page.html
-                page_text = page.text
+        for index, page in enumerate(pages, 1):
+            if cancel_check and cancel_check():
+                break
+            markdown = page["markdown"]
+            html = f"<html><body><pre>{escape(markdown)}</pre></body></html>"
             evidence = self.evidence.build(
-                url=page.url, html=html, text=page_text, status=page.status,
-                rendered=False, source=page.source,
+                url=page["url"],
+                html=html,
+                text=markdown,
+                status=page["status"],
+                rendered=True,
+                source="firecrawl",
             )
             evidence_id = _persist_evidence(scrap_id, evidence)
+            if evidence_ids_out is not None and evidence_id:
+                evidence_ids_out.append(evidence_id)
+            emit_event(sink, "Evidence", f"Firecrawl page {index} collected", page=index, evidence=index)
+
             try:
-                extracted = await self.extractor.extract(html, page.url, evidence=evidence)
+                extracted = await self.extractor.extract(html, page["url"], evidence=evidence)
             except Exception as exc:
                 emit_event(sink, "Extraction", f"Enrichment extraction failed: {type(exc).__name__}: {exc}")
                 continue
-            qualified = [lead_item for lead_item in extracted if self.qualifier.qualify(lead_item, criteria).relevant]
-            for lead_item in qualified:
-                _persist_lead(scrap_id, lead_item, evidence_id=evidence_id)
+
+            qualified = [item for item in extracted if self.qualifier.qualify(item, criteria).relevant]
+            if persist_leads:
+                for item in qualified:
+                    _persist_lead(scrap_id, item, evidence_id=evidence_id)
             leads.extend(qualified)
-            emit_event(
-                sink, "Leads", "Enrichment candidates processed",
-                extracted=len(extracted), qualified=len(qualified), leads=len(leads),
-            )
-            if should_stop():
-                break
-        if stop_reason == "time_limit":
-            emit_event(sink, "Collection", "Enrichment timeout reached", state="completed", stop_reason=stop_reason)
-        elif stop_reason == "canceled":
-            emit_event(sink, "Collection", "Enrichment canceled", state="canceled", stop_reason=stop_reason)
-        else:
-            emit_event(sink, "Collection", "Enrichment complete", state="completed")
+            emit_event(sink, "Leads", "Firecrawl enrichment candidates processed",
+                       extracted=len(extracted), qualified=len(qualified), leads=len(leads))
+
+        emit_event(sink, "Collection", "Firecrawl enrichment complete",
+                   state="completed", pages_collected=len(pages), urls_total=len(search_items))
         return dedupe(leads)
 
+    async def enrich_lead_paid(self, criteria: SearchCriteria, lead: Lead, event_sink=None, scrap_id=None, cancel_check=None, provider_started=None, discover_new_leads=False) -> list[Lead]:
+        sink = event_sink or NullJobEventSink()
+        if cancel_check and cancel_check():
+            return []
+
+        enricher = FirecrawlEnricher()
+        emit_event(sink, "Search", "Running paid Firecrawl enrichment search")
+        if provider_started:
+            provider_started()
+        search_items, pages = await asyncio.to_thread(enricher.collect, lead)
+        search_evidence_id = None
+        if search_items:
+            search_evidence = self.evidence.build(
+                url=search_items[0]["url"],
+                html="",
+                text="\n".join(
+                    f"{item['title']}\n{item['snippet']}\n{item['url']}"
+                    for item in search_items
+                ),
+                status=200,
+                rendered=False,
+                source="firecrawl_search",
+            )
+            search_evidence_id = _persist_evidence(scrap_id, search_evidence)
+
+        page_evidence_ids = []
+        firecrawl_leads = await self.enrich_lead(
+            criteria, lead, event_sink=sink, scrap_id=scrap_id,
+            cancel_check=cancel_check, firecrawl_data=(search_items, pages),
+            persist_leads=False, persist_search_evidence=False,
+            evidence_ids_out=page_evidence_ids,
+        )
+        context = "\n".join(
+            f"{page['title']}\n{page['markdown'][:6000]}"
+            for page in pages[:3]
+        )
+        eligible_pages = [page for page in pages if not page.get("linkedin_source")]
+        llm_allowed = bool(pages) and (bool(lead.email) or bool(eligible_pages))
+        if search_items and llm_allowed:
+            candidates, llm_usage = await asyncio.to_thread(llm_candidates, lead, context, search_items)
+        else:
+            candidates = []
+            llm_usage = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cost_usd": 0.0,
+                "model": os.getenv("LLM_ENRICHMENT_MODEL", "openai/gpt-oss-20b"),
+            }
+            emit_event(sink, "Enrichment", "No independent external sources found; no LLM enrichment performed", state="warning")
+        firecrawl_usage = dict(enricher.usage)
+        for scrape_error in firecrawl_usage.get("scrape_errors", []):
+            emit_event(sink, "Collection", "Firecrawl scrape failed", state="warning", **scrape_error)
+        emit_event(
+            sink, "Telemetry", "Paid enrichment provider usage recorded",
+            firecrawl=firecrawl_usage, llm=llm_usage,
+            provider_cost_usd=llm_usage.get('cost_usd', 0.0),
+            firecrawl_estimated_credits=firecrawl_usage.get('estimated_credits', 0),
+        )
+        merged_existing = lead
+        new_leads = []
+        for candidate in firecrawl_leads + candidates:
+            relation = _enrichment_identity_relation(lead, candidate)
+            if relation == "MATCH":
+                merged_existing = _merge_enrichment(merged_existing, candidate, self.generic_prefixes, evidence_pages=pages, event_sink=sink)
+                continue
+            # A personal email is a complete new-Lead identity; without one,
+            # discovery requires identity corroboration rather than name-only matching.
+            if discover_new_leads and candidate.email:
+                match_index = next((i for i, item in enumerate(new_leads) if _same_enrichment_person(item, candidate)), None)
+                if match_index is not None:
+                    new_leads[match_index] = _merge_enrichment(new_leads[match_index], candidate, self.generic_prefixes, evidence_pages=pages, event_sink=sink)
+                else:
+                    new_leads.append(candidate)
+            elif relation == "SAME_NAME_DIFFERENT_PERSON":
+                emit_event(sink, "Enrichment", "Rejected same-name different-person candidate", candidate_name=f"{candidate.first_name or ''} {candidate.last_name or ''}".strip(), reason="identity_conflict")
+
+        merged_result = self.qualifier.qualify(merged_existing, criteria)
+        qualified_existing = merged_result.relevant
+        changed_fields = {
+            field: {"before": getattr(lead, field), "after": getattr(merged_existing, field)}
+            for field in _ENRICHMENT_FIELDS
+            if getattr(lead, field) != getattr(merged_existing, field)
+        }
+        if changed_fields:
+            emit_event(sink, "Enrichment", "Evidence-backed Lead corrections applied", lead_id=str(getattr(lead, "id", "") or ""), changed_fields=changed_fields)
+        enrichment_evidence_ids = ([search_evidence_id] if search_evidence_id else []) + page_evidence_ids
+        if qualified_existing:
+            _persist_lead(scrap_id, merged_existing, evidence_id=enrichment_evidence_ids)
+        else:
+            emit_event(sink, "Qualification", "Existing enriched Lead failed qualification; retaining prior persisted record", state="rejected")
+        qualified_new = []
+        if not discover_new_leads:
+            if new_leads:
+                emit_event(sink, "Leads", "New Lead discovery disabled; unrelated enrichment candidates discarded", discarded=len(new_leads), state="info")
+            new_leads = []
+        for candidate in new_leads:
+            result = self.qualifier.qualify(candidate, criteria)
+            if result.relevant:
+                created = _persist_lead(scrap_id, candidate, evidence_id=enrichment_evidence_ids)
+                if created:
+                    qualified_new.append(candidate)
+                else:
+                    emit_event(sink, "Leads", "Discovered candidate matched an existing Lead; not counted as new", email=str(candidate.email or ""), state="info")
+        final_leads = ([merged_existing] if qualified_existing and changed_fields else []) + dedupe(qualified_new)
+        emit_event(
+            sink, "Leads", "Paid enrichment result",
+            extracted=len(candidates), qualified=(1 if qualified_existing else 0) + len(qualified_new),
+            leads_enriched=1 if changed_fields else 0, fields_changed=len(changed_fields),
+            new_leads=len(qualified_new), leads=len(final_leads)
+        )
+        return final_leads, firecrawl_usage, llm_usage
 
     async def run_urls(self, criteria: SearchCriteria, urls, event_sink=None, scrap_id=None, cancel_check=None) -> list[Lead]:
         """Run the autonomous collection/extraction pipeline on human-imported URL occurrences."""

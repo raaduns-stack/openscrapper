@@ -133,6 +133,52 @@ def test_lead_qualification_rejects_unrelated_lead():
     assert not result.relevant
 
 
+def test_harvested_uses_bounded_scrapy_fallbacks():
+    import asyncio
+    from src.models.criteria import CrawlerConfig, SearchCriteria
+    from src.pipeline import LeadDiscoveryPipeline
+
+    pipeline = LeadDiscoveryPipeline(crawler_config=CrawlerConfig())
+    captured = {}
+
+    async def fake_stream_pages(urls, **kwargs):
+        captured["collector"] = kwargs["collector"]
+        if False:
+            yield None
+
+    pipeline._stream_pages = fake_stream_pages
+    result = asyncio.run(pipeline.run_harvested(
+        SearchCriteria(industry="gold", max_leads=10),
+        [{"url": "https://example.com", "title": "Jane Doe RN", "snippet": "Jane Doe RN"}],
+    ))
+    assert captured["collector"].max_pages == 100
+    assert captured["collector"].max_urls == 250
+    assert captured["collector"].max_depth == 5
+
+
+def test_harvested_preserves_explicit_scrapy_limits():
+    import asyncio
+    from src.models.criteria import CrawlerConfig, SearchCriteria
+    from src.pipeline import LeadDiscoveryPipeline
+
+    pipeline = LeadDiscoveryPipeline(crawler_config=CrawlerConfig(max_crawl_pages=25, max_crawl_urls=75, max_crawl_depth=2))
+    captured = {}
+
+    async def fake_stream_pages(urls, **kwargs):
+        captured["collector"] = kwargs["collector"]
+        if False:
+            yield None
+
+    pipeline._stream_pages = fake_stream_pages
+    asyncio.run(pipeline.run_harvested(
+        SearchCriteria(industry="gold", max_leads=10),
+        [{"url": "https://example.com", "title": "Jane Doe RN", "snippet": "Jane Doe RN"}],
+    ))
+    assert captured["collector"].max_pages == 25
+    assert captured["collector"].max_urls == 75
+    assert captured["collector"].max_depth == 2
+
+
 def test_harvested_collection_failure_propagates():
     import asyncio
     from src.models.criteria import SearchCriteria

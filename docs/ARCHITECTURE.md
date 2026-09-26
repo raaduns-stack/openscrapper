@@ -36,10 +36,18 @@ normal HTML             scrapy-playwright
         Evidence / Content
                 |
                 v
-     Deterministic Extraction
+   First-level Extraction
+ deterministic -> GLiNER-Relex
                 |
                 v
-       LLM Research if needed
+          Qualification
+                |
+                v
+   Controlled Enrichment
+ correction / completion
+                |
+                v
+   Page Extraction / Validation
                 |
                 v
    OpenClaw if browser needed

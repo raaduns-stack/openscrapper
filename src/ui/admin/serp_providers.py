@@ -1,8 +1,6 @@
-import requests
 import streamlit as st
 
 def render_serp_providers(api, api_json, api_error, **kwargs):
-    with admin_tabs[3]:
         st.subheader('Premium SERP Providers')
         st.caption('Exactly four providers are supported. Credentials are stored encrypted server-side.')
         try: providers=api_json('GET','/admin/premium-providers')

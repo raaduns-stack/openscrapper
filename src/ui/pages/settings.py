@@ -42,4 +42,3 @@ def render_settings(api, api_json):
     else:
         st.caption('No domain rules configured.')
     st.divider()
-    render_admin(api, api_json, api_error)

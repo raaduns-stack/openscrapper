@@ -1,8 +1,6 @@
-import requests
 import streamlit as st
 
 def render_wallets(api, api_json, api_error, **kwargs):
-    with admin_tabs[1]:
         st.subheader('Wallet Adjustments')
         st.caption('Add or remove wallet credit for any user.')
         try:

@@ -196,3 +196,8 @@ PyJWT==2.13.0
 pwdlib==0.3.0
 
 scrapy-playwright==0.0.48
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
+transformers==4.57.6
+gliner==0.2.29

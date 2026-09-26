@@ -41,15 +41,15 @@ class LeadQualifier:
                 score += 2.0
                 reasons.append(f"role:{role}")
 
-        # Source of truth: acceptance is based on person identity plus
-        # person-specific supporting evidence. Personal email is optional.
-        from src.models.lead import has_person_specific_evidence
+        # Source of truth: any personal email qualifies alone; otherwise require
+        # person identity plus at least one supporting person-specific field.
+        from src.models.lead import is_accepted_lead
 
         if lead.email:
             score += 1.0
             reasons.append("personal_email")
 
-        if has_person_specific_evidence(lead):
+        if is_accepted_lead(lead):
             reasons.append("person_specific_evidence")
             return QualificationResult(
                 relevant=True,

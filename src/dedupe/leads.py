@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 from psycopg.types.json import Jsonb
 
 from src.db import db
-from src.models.lead import Lead
+from src.models.lead import Lead, is_protected_lead_field, strip_protected_lead_fields
 
 
 def _normalize(value: str | None) -> str:
@@ -43,6 +43,27 @@ def identity_keys(lead: Lead) -> set[tuple[str, ...]]:
         keys.add(("source_person", source, first, last))
     if first and last and company:
         keys.add(("person_company", first, last, company))
+    return keys
+
+
+def enrichment_identity_keys(lead: Lead) -> set[tuple[str, ...]]:
+    """Identity keys for cross-source enrichment; source_url is provenance only."""
+    email = _normalize_email(str(lead.email) if lead.email else None)
+    phone = _normalize_phone(lead.phone)
+    first = _normalize(lead.first_name)
+    last = _normalize(lead.last_name)
+    company = _normalize(lead.company_name)
+    state = _normalize(lead.state)
+    country = _normalize(lead.country)
+    keys: set[tuple[str, ...]] = set()
+    if email:
+        keys.add(("email", email))
+    if phone:
+        keys.add(("phone", phone))
+    if first and last and company:
+        keys.add(("person_company", first, last, company))
+    if first and last and state and country:
+        keys.add(("person_geography", first, last, state, country))
     return keys
 
 
@@ -103,14 +124,20 @@ def persist_lead(scrap_id, lead: Lead, evidence_id=None) -> bool:
                 if existing:
                     break
         if existing:
+            existing_status = conn.execute("SELECT status FROM leads WHERE id=%s", (existing[0],)).fetchone()
+            if existing_status and existing_status[0] == "completed":
+                return False
             existing_data = existing[1] or {}
             merged = dict(existing_data)
+            lead_data = lead.model_dump(mode="json")
             for field in (
                 "first_name", "last_name", "position", "company_name",
                 "country", "city", "state", "email", "phone", "website",
                 "source_url",
             ):
-                value = getattr(lead, field)
+                if is_protected_lead_field(field):
+                    continue
+                value = lead_data.get(field)
                 if value not in (None, ""):
                     merged[field] = value
             if existing_data.get("capture_stage", "scrapy") != lead.capture_stage:
@@ -122,19 +149,27 @@ def persist_lead(scrap_id, lead: Lead, evidence_id=None) -> bool:
             lead_id = existing[0]
             created = False
         else:
+            gated_data = strip_protected_lead_fields(dict(data))
+            if gated_data != data:
+                try:
+                    gated_data = Lead.model_validate(gated_data).model_dump(mode="json")
+                except Exception:
+                    return False
             lead_id = uuid.uuid4()
             conn.execute(
                 "INSERT INTO leads(id,scrap_id,data) VALUES(%s,%s,%s)",
-                (lead_id, sid, Jsonb(data)),
+                (lead_id, sid, Jsonb(gated_data)),
             )
             created = True
 
-        if evidence_id:
-            conn.execute(
-                "INSERT INTO lead_sources(lead_id,evidence_id) "
-                "VALUES(%s,%s) ON CONFLICT DO NOTHING",
-                (lead_id, evidence_id),
-            )
+        evidence_ids = evidence_id if isinstance(evidence_id, (list, tuple, set)) else [evidence_id]
+        for current_evidence_id in evidence_ids:
+            if current_evidence_id:
+                conn.execute(
+                    "INSERT INTO lead_sources(lead_id,evidence_id) "
+                    "VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                    (lead_id, current_evidence_id),
+                )
         conn.commit()
     return created
 

@@ -1,6 +1,6 @@
 # ADR-0002 — Extraction Engine Benchmark
 
-**Status:** Proposed benchmark; no production architecture change approved.
+**Status:** Benchmark complete; GLiNER-Relex primary SERP extraction approved and implemented.
 **Date:** 2026-09-20
 **Decision owner:** CTO
 
@@ -83,9 +83,10 @@ Official references:
 ## 5. Benchmark corpus
 
 Use a fixed corpus of existing SERP evidence already available in the project. The initial
-benchmark target is the previously audited 150 SERP records, including positive cases,
-false positives, email-only records, generic-page titles, profile pages, and varied evidence
-wording.
+benchmark target is 150 persisted SERP records, including positive cases, false positives,
+email-only records, generic-page titles, profile pages, and varied evidence wording. The
+first smoke run used the latest 150 persisted `serp_results` records available at execution
+time; this is distinct from the earlier 150-record audit used to inspect the existing Lead set.
 
 The corpus must be frozen for each benchmark run so candidate systems receive identical
 input. No production records are modified by the benchmark.
@@ -189,3 +190,75 @@ No outcome is preselected by this ADR.
 7. CTO reviews results and chooses the integration direction.
 
 **This ADR authorizes the benchmark spike only. It does not authorize production integration.**
+## 13. Initial smoke-benchmark result — 2026-09-20
+
+A read-only smoke benchmark was executed against a frozen 150-record SERP corpus. The
+production database was not modified. The comparison used the current deterministic parser,
+spaCy `en_core_web_sm`, and GLiNER2.5 small on CPU.
+
+Observed output:
+
+| Engine | Person records | Supporting-evidence records | Existing Lead contract accepted |
+|---|---:|---:|---:|
+| Current deterministic | 29 | 7 | 7 |
+| spaCy `en_core_web_sm` | 91 | 91 | 86 |
+| GLiNER2.5 small | 96 | 95 | 70 |
+
+These are **not precision/recall measurements** because the 150 records do not yet have a
+manually verified gold label set. They must not be interpreted as accuracy scores.
+
+The smoke test demonstrates two important engineering facts:
+
+1. Mature NER/IE components recover substantially more person and supporting-field mentions
+   than the current deterministic parser on this corpus.
+2. Naively accepting any extracted person plus any extracted supporting field creates clear
+   false associations. For example, GLiNER2 can associate organization/page-title entities
+   with a person candidate that is not a real individual lead.
+
+A direct replacement with raw NER output is therefore not approved. The next benchmark step
+must test person-to-role/company/location association using schema/relations/context and a
+manually reviewed gold subset before any production integration decision.
+
+The current benchmark used the CPU-oriented `fastino/gliner2.5-small-v1` checkpoint. The
+GLiNER2 project documents `fastino/gliner2.5-base-v1` as its default English multi-task
+checkpoint and the small checkpoint as the fast CPU/edge option.
+
+## 10. Approved implementation: deterministic SERP discovery with contextual enrichment
+
+The CTO selected Option B after the live SERP attribution defect: deterministic extraction is the candidate-discovery layer; GLiNER-Relex is an enrichment layer. The production extraction boundary remains authoritative:
+
+1. Run the deterministic SERP extractor first for each SERP record.
+2. A personal email may form a complete candidate even when no person name is present.
+3. Run GLiNER-Relex only to enrich a deterministic candidate with missing person-specific fields.
+4. Never promote a contextual-only title/category guess into an accepted SERP lead.
+5. Relation confidence remains at or above the configured threshold for contextual fields.
+6. Validate the final merged candidate through the authoritative `Lead` contract before qualification and persistence.
+7. If contextual extraction fails, the deterministic candidate remains valid and the scrape continues.
+
+The deterministic layer also requires explicit person evidence for name-based candidates; generic title/category text without person evidence is rejected.
+
+Configuration:
+- `CLAW_CONTEXTUAL_EXTRACTION=1` enables contextual enrichment (default).
+- `CLAW_CONTEXTUAL_EXTRACTION=0` disables contextual enrichment and retains deterministic-only SERP extraction.
+- `CLAW_CONTEXTUAL_MODEL` selects the GLiNER-Relex model.
+- `CLAW_CONTEXTUAL_RELATION_THRESHOLD` controls the minimum relation confidence; default `0.80`.
+
+GLiNER-Relex is not the authoritative candidate-discovery layer or qualification layer. No raw NER/relationship output may bypass the existing `Lead` contract.
+
+## 14. Integration boundary: first-level extraction vs enrichment
+
+The CTO-approved operating model treats SERP extraction as first-level candidate recovery rather than final-field verification.
+
+## 15. Approved SERP extraction mode: deterministic discovery + GLiNER-Relex enrichment
+
+The CTO selected Option B after the live SERP attribution defect. For each SERP record, the deterministic parser runs first and establishes the candidate. GLiNER-Relex then enriches only that candidate with missing contextual fields. There is no contextual-only promotion path.
+
+Personal email is a complete acceptance path. Deterministic name-based candidates require explicit person evidence; generic title/category text is rejected. The final merged record must pass the authoritative Lead contract before qualification and persistence.
+
+The general LLM extractor is not invoked by this SERP path. GLiNER-Relex is an enrichment component, not the authority for candidate discovery or lead correctness.
+
+Enrichment remains responsible for deeper correction and completion. The controlled Scrapy enrichment engine revisits the persisted lead's source URL and related bounded pages, applies the page extraction stack, validates extracted candidates, and persists supported field corrections/additions through the same authoritative persistence path. It may also discover additional qualifying people.
+
+This separation keeps first-level SERP discovery deterministic and evidence-gated while allowing contextual extraction to improve completeness without turning page titles or category text into false leads.
+
+No separate qualification contract, persistence path, or dedupe path is permitted for contextual extraction or enrichment.

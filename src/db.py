@@ -71,8 +71,12 @@ CREATE TABLE IF NOT EXISTS evidence (
  id UUID PRIMARY KEY, scrap_id UUID NOT NULL REFERENCES scraps(id) ON DELETE CASCADE, source_type TEXT NOT NULL, source_id UUID, data JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS leads (
- id UUID PRIMARY KEY, scrap_id UUID NOT NULL REFERENCES scraps(id) ON DELETE CASCADE, data JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+ id UUID PRIMARY KEY, scrap_id UUID NOT NULL REFERENCES scraps(id) ON DELETE CASCADE, data JSONB NOT NULL, status TEXT NOT NULL DEFAULT 'working' CHECK(status IN ('working','completed')), approved_at TIMESTAMPTZ, approved_by UUID REFERENCES users(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'working';
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS approved_by UUID REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_leads_scrap_status ON leads(scrap_id,status,created_at);
 CREATE TABLE IF NOT EXISTS lead_sources (
  lead_id UUID NOT NULL REFERENCES leads(id) ON DELETE CASCADE, evidence_id UUID REFERENCES evidence(id) ON DELETE SET NULL
 );
@@ -94,6 +98,53 @@ CREATE INDEX IF NOT EXISTS idx_evidence_scrap ON evidence(scrap_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_lead_sources_lead ON lead_sources(lead_id);
 CREATE INDEX IF NOT EXISTS idx_lead_sources_evidence ON lead_sources(evidence_id);
 CREATE INDEX IF NOT EXISTS idx_exports_scrap ON exports(scrap_id, created_at);
+CREATE TABLE IF NOT EXISTS sender_accounts (
+ id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ display_name TEXT NOT NULL, email TEXT NOT NULL, provider TEXT NOT NULL CHECK(provider IN ('smtp','gmail_oauth','microsoft_oauth')),
+ enabled BOOLEAN NOT NULL DEFAULT true, health TEXT NOT NULL DEFAULT 'unknown',
+ config JSONB NOT NULL DEFAULT '{}', secret_encrypted TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ UNIQUE(user_id,email)
+);
+CREATE TABLE IF NOT EXISTS sender_letters (
+ id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, subject TEXT NOT NULL, body_text TEXT NOT NULL, body_html TEXT,
+ variables JSONB NOT NULL DEFAULT '[]', active BOOLEAN NOT NULL DEFAULT true,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS sender_campaigns (
+ id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, sender_id UUID NOT NULL REFERENCES sender_accounts(id) ON DELETE RESTRICT,
+ letter_id UUID NOT NULL REFERENCES sender_letters(id) ON DELETE RESTRICT,
+ status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','active','paused','completed')),
+ config JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS sender_campaign_leads (
+ campaign_id UUID NOT NULL REFERENCES sender_campaigns(id) ON DELETE CASCADE,
+ lead_id UUID NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+ user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ PRIMARY KEY(campaign_id,lead_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sender_campaign_leads_user ON sender_campaign_leads(user_id,campaign_id);
+CREATE TABLE IF NOT EXISTS sender_messages (
+ id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ campaign_id UUID REFERENCES sender_campaigns(id) ON DELETE SET NULL,
+ lead_id UUID REFERENCES leads(id) ON DELETE SET NULL, sender_id UUID REFERENCES sender_accounts(id) ON DELETE SET NULL,
+ recipient_email TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','sent','failed','replied')),
+ idempotency_key TEXT NOT NULL, reply_to TEXT, provider_message_id TEXT, error TEXT,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ UNIQUE(user_id,idempotency_key)
+);
+CREATE TABLE IF NOT EXISTS sender_oauth_states (
+ state TEXT PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ sender_id UUID NOT NULL REFERENCES sender_accounts(id) ON DELETE CASCADE,
+ provider TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sender_oauth_states_expiry ON sender_oauth_states(expires_at);
+CREATE INDEX IF NOT EXISTS idx_sender_accounts_user ON sender_accounts(user_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sender_letters_user ON sender_letters(user_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sender_campaigns_user ON sender_campaigns(user_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sender_messages_user ON sender_messages(user_id,created_at DESC);
 """
 
 @contextmanager
@@ -105,12 +156,17 @@ def db():
 def init_db():
     with db() as conn:
         conn.execute(SCHEMA)
+        conn.execute("ALTER TABLE sender_messages DROP CONSTRAINT IF EXISTS sender_messages_status_check")
+        conn.execute("ALTER TABLE sender_messages ADD CONSTRAINT sender_messages_status_check CHECK(status IN ('queued','sending','sent','failed','replied'))")
+        conn.execute("ALTER TABLE leads DROP CONSTRAINT IF EXISTS leads_status_check")
+        conn.execute("ALTER TABLE leads ADD CONSTRAINT leads_status_check CHECK(status IN ('working','completed'))")
         conn.execute("ALTER TABLE crawl_pages ADD COLUMN IF NOT EXISTS request_index INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE crawl_pages ADD COLUMN IF NOT EXISTS depth INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE crawl_pages ADD COLUMN IF NOT EXISTS occurrence_index INTEGER NOT NULL DEFAULT 0")
         conn.execute("INSERT INTO app_settings(key,value) VALUES('scrap_creation_price_cents','200'::jsonb) ON CONFLICT(key) DO NOTHING")
         conn.execute("INSERT INTO app_settings(key,value) VALUES('serp_result_limit','1000'::jsonb) ON CONFLICT(key) DO NOTHING")
         conn.execute("INSERT INTO app_settings(key,value) VALUES('premium_serp_price_cents','100'::jsonb) ON CONFLICT(key) DO NOTHING")
+        conn.execute("INSERT INTO app_settings(key,value) VALUES('paid_enrichment_unit_micros_usd','1000'::jsonb) ON CONFLICT(key) DO NOTHING")
         conn.execute("INSERT INTO app_settings(key,value) VALUES('research_default_max_leads','100'::jsonb) ON CONFLICT(key) DO NOTHING")
         conn.execute("INSERT INTO app_settings(key,value) VALUES('research_max_leads','10000'::jsonb) ON CONFLICT(key) DO NOTHING")
         conn.execute("INSERT INTO app_settings(key,value) VALUES('research_timeout_hours','48'::jsonb) ON CONFLICT(key) DO NOTHING")

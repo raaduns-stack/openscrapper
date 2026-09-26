@@ -1,4 +1,5 @@
 import re
+import requests
 import streamlit as st
 from src.agent.query_interpreter import QueryInterpreter
 from src.models.criteria import SearchCriteria

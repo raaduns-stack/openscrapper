@@ -453,8 +453,8 @@ class ScrapyCollector:
         self.max_urls = max_urls
         self.max_depth = max_depth
 
-    def collect(self, urls, progress_callback=None, scrap_id=None, page_callback=None, cancel_check=None):
-        candidates = _candidate_urls(urls, self.max_urls)
+    def collect(self, urls, progress_callback=None, scrap_id=None, page_callback=None, cancel_check=None, stop_check=None):
+        candidates = _candidate_urls([str(url) for url in urls], self.max_urls)
         if not candidates:
             return []
         payload = {"urls": candidates, "max_pages": self.max_pages, "max_urls": self.max_urls, "max_depth": self.max_depth}
@@ -483,6 +483,15 @@ class ScrapyCollector:
                     if progress_callback:
                         progress_callback({"state": "canceled", "urls_submitted": len(candidates), "pages_collected": int(latest_progress.get("pages_collected", 0)), "pages_failed": int(latest_progress.get("pages_failed", 0)), "message": "Scrapy collection worker terminated by cancellation"})
                     raise RuntimeError("Scrapy collection canceled")
+                if stop_check and stop_check():
+                    try:
+                        os.killpg(result.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    result.wait(timeout=10)
+                    if progress_callback:
+                        progress_callback({"state": "completed", "urls_submitted": len(candidates), "pages_collected": int(latest_progress.get("pages_collected", 0)), "pages_failed": int(latest_progress.get("pages_failed", 0)), "message": "Scrapy collection stopped by research limit"})
+                    return []
                 line = line.rstrip("\n")
                 if line.startswith("CLAW_PROGRESS="):
                     try:
@@ -546,5 +555,5 @@ class ScrapyCollector:
                 pass
         return sorted(pages, key=lambda page: page.request_index)
 
-    async def collect_async(self, urls, progress_callback=None, scrap_id=None, page_callback=None, cancel_check=None):
-        return await asyncio.to_thread(self.collect, urls, progress_callback, scrap_id, page_callback, cancel_check)
+    async def collect_async(self, urls, progress_callback=None, scrap_id=None, page_callback=None, cancel_check=None, stop_check=None):
+        return await asyncio.to_thread(self.collect, urls, progress_callback, scrap_id, page_callback, cancel_check, stop_check)

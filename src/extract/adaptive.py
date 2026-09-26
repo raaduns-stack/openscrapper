@@ -387,8 +387,8 @@ class AdaptiveLeadExtractor:
             "Extract INDIVIDUAL business contacts from this page.\n\n"
             f"EXACT SOURCE URL: {source_url}\n\n"
             "Acceptance rules:\n"
-            + "1. Every returned lead MUST contain a person name plus at least one supporting field: position, company, phone, city, state, country, or website. Email is optional but must be personal when present.\n"
-            + "2. Email-only and name-only records are invalid.\n"
+            + "1. A personal email alone is a valid lead. Otherwise every returned lead MUST contain a person name plus at least one supporting field: position, company, phone, city, state, country, or website. If email is present it must be personal.\n"
+            + "2. Generic-email-only, name-only, company-only, and other unsupported records are invalid.\n"
             + "3. Reject generic role mailboxes such as info@, contact@, sales@, support@, admin@ and similar.\n"
             + "4. Prefer both first_name and last_name when explicitly present.\n"
             + "5. Extract position, company_name, country, city, state, phone and website whenever represented.\n"
@@ -409,8 +409,8 @@ class AdaptiveLeadExtractor:
                 attempt_prompt += (
                     "\n\nCORRECTION REQUIRED:\n"
                     "The previous response failed structured-output or acceptance validation. "
-                    "Return only leads with a person name plus at least one supporting field: position, company, phone, city, state, country, or website. "
-                    "Personal email is optional but must be personal when present. "
+                    "Return personal-email-only leads when no other fields are available; otherwise require a person name plus at least one supporting field. "
+                    "If email is present it must be personal. "
                     "Do not invent values; use null for unavailable enrichment fields. "
                     "Preserve source_url exactly."
                 )

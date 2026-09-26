@@ -1,25 +1,28 @@
 from dotenv import load_dotenv
 load_dotenv()
-import asyncio, secrets, time, uuid, os
+import asyncio, secrets, time, uuid, os, math
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 from typing import Literal
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field, model_validator
 from src.models.criteria import CrawlerConfig, SearchCriteria
 from src.models.lead import Lead
 from src.pipeline import LeadDiscoveryPipeline
 from src.dedupe.leads import persist_lead
-from src.observability.job_events import JobEventSink
+from src.observability.job_events import JobEventSink, emit_event
 from src.search.strategy import SearchStrategyEngine
 from src.search.premium import HttpPremiumSerpProvider, parse_search_url, SUPPORTED_PROVIDERS, provider_statuses, save_provider_config
 from src.db import db, init_db, purge_expired_history, get_client_policies
 from src.auth import create_user, login_user, current_user, create_session
 import hashlib
 from psycopg.types.json import Jsonb
+from src.senders import service as sender_service
+from src.senders import gmail as gmail_oauth
 
 @asynccontextmanager
 async def lifespan(_app):
@@ -116,6 +119,40 @@ class ScrapRequest(BaseModel):
 class AdminBulkDeleteUsersRequest(BaseModel):
     user_ids: list[str] = Field(min_length=1,max_length=200)
 
+class EnrichmentRequest(BaseModel):
+    lead_ids: list[str] = Field(min_length=1,max_length=200)
+    discover_new_leads: bool = False
+
+class SenderRequest(BaseModel):
+    display_name: str = Field(min_length=1,max_length=200)
+    email: str = Field(min_length=3,max_length=320)
+    provider: Literal["smtp","gmail_oauth","microsoft_oauth"]
+    enabled: bool = True
+    config: dict = Field(default_factory=dict)
+    password: str | None = Field(default=None,max_length=500)
+
+class SenderUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None,min_length=1,max_length=200)
+    email: str | None = Field(default=None,min_length=3,max_length=320)
+    enabled: bool | None = None
+    config: dict | None = None
+    password: str | None = Field(default=None,max_length=500)
+
+class LetterRequest(BaseModel):
+    name: str = Field(min_length=1,max_length=200)
+    subject: str = Field(min_length=1,max_length=500)
+    body_text: str = Field(min_length=1)
+    body_html: str | None = None
+    variables: list[str] = Field(default_factory=list)
+    active: bool = True
+
+class CampaignRequest(BaseModel):
+    name: str = Field(min_length=1,max_length=200)
+    sender_id: str
+    letter_id: str
+    lead_ids: list[str] = Field(min_length=1,max_length=10000)
+    config: dict = Field(default_factory=dict)
+
 @app.post("/auth/register")
 def register(request: AuthRequest):
     try: user_id=create_user(request.email,request.password)
@@ -147,6 +184,151 @@ def logout(request: Request):
 def me(request: Request):
     user=current_user(request); return {"id":user["id"],"email":user["email"]}
 
+
+@app.get("/senders")
+def get_senders(req: Request):
+    user=current_user(req)
+    return sender_service.list_senders(uuid.UUID(user["id"]))
+
+@app.get("/senders/{sender_id}")
+def get_sender_config(sender_id: str, req: Request):
+    user=current_user(req)
+    try: sid=uuid.UUID(sender_id)
+    except ValueError: raise HTTPException(422,"Invalid sender id")
+    row=sender_service.sender_config(uuid.UUID(user["id"]),sid)
+    if not row: raise HTTPException(404,"Sender not found")
+    return row
+
+@app.post("/senders")
+def add_sender(request: SenderRequest, req: Request):
+    user=current_user(req)
+    try:
+        return sender_service.create_sender(uuid.UUID(user["id"]),request.model_dump(exclude_none=True))
+    except RuntimeError as exc:
+        raise HTTPException(503,str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(400,"Could not create sender") from exc
+
+@app.patch("/senders/{sender_id}")
+def patch_sender(sender_id: str, request: SenderUpdateRequest, req: Request):
+    user=current_user(req)
+    try: sid=uuid.UUID(sender_id)
+    except ValueError: raise HTTPException(422,"Invalid sender id")
+    row=sender_service.update_sender(uuid.UUID(user["id"]),sid,request.model_dump(exclude_none=True))
+    if not row: raise HTTPException(404,"Sender not found")
+    return row
+
+@app.delete("/senders/{sender_id}",status_code=204)
+def remove_sender(sender_id: str, req: Request):
+    user=current_user(req)
+    try: sid=uuid.UUID(sender_id)
+    except ValueError: raise HTTPException(422,"Invalid sender id")
+    if not sender_service.delete_sender(uuid.UUID(user["id"]),sid): raise HTTPException(404,"Sender not found")
+
+@app.post("/senders/{sender_id}/test")
+def test_sender(sender_id: str, req: Request):
+    user=current_user(req)
+    try: sid=uuid.UUID(sender_id)
+    except ValueError: raise HTTPException(422,"Invalid sender id")
+    try: return sender_service.test_smtp(uuid.UUID(user["id"]),sid)
+    except LookupError as exc: raise HTTPException(404,str(exc))
+    except Exception as exc: raise HTTPException(502,f"Sender connection failed: {exc}") from exc
+
+@app.get("/senders/{sender_id}/oauth/gmail/start")
+def start_gmail_oauth(sender_id: str, req: Request):
+    user=current_user(req)
+    try: sid=uuid.UUID(sender_id)
+    except ValueError: raise HTTPException(422,"Invalid sender id")
+    row=sender_service.sender_config(uuid.UUID(user["id"]),sid)
+    if not row: raise HTTPException(404,"Sender not found")
+    if row["provider"]!="gmail_oauth": raise HTTPException(400,"Sender is not configured for Gmail OAuth")
+    try:
+        return {"authorization_url":gmail_oauth.start(uuid.UUID(user["id"]),sid)}
+    except RuntimeError as exc: raise HTTPException(503,str(exc)) from exc
+
+@app.get("/oauth/gmail/callback",include_in_schema=False)
+def gmail_oauth_callback(state: str="", code: str="", error: str=""):
+    if error:
+        return RedirectResponse("https://scrapee.uk/?sender_oauth=error#sender-health")
+    try:
+        gmail_oauth.callback(state,code)
+        return RedirectResponse("https://scrapee.uk/?sender_oauth=success#sender-health")
+    except Exception:
+        return RedirectResponse("https://scrapee.uk/?sender_oauth=error#sender-health")
+
+@app.post("/senders/{sender_id}/oauth/gmail/disconnect")
+def disconnect_gmail_oauth(sender_id: str, req: Request):
+    user=current_user(req)
+    try: sid=uuid.UUID(sender_id)
+    except ValueError: raise HTTPException(422,"Invalid sender id")
+    try:
+        gmail_oauth.disconnect(uuid.UUID(user["id"]),sid)
+        return {"ok":True}
+    except LookupError as exc: raise HTTPException(404,str(exc))
+    except ValueError as exc: raise HTTPException(400,str(exc))
+
+@app.get("/letters")
+def get_letters(req: Request):
+    user=current_user(req)
+    return sender_service.list_letters(uuid.UUID(user["id"]))
+
+@app.post("/letters")
+def add_letter(request: LetterRequest, req: Request):
+    user=current_user(req)
+    return sender_service.create_letter(uuid.UUID(user["id"]),request.model_dump())
+
+@app.delete("/letters/{letter_id}",status_code=204)
+def remove_letter(letter_id: str, req: Request):
+    user=current_user(req)
+    try: lid=uuid.UUID(letter_id)
+    except ValueError: raise HTTPException(422,"Invalid letter id")
+    if not sender_service.delete_letter(uuid.UUID(user["id"]),lid): raise HTTPException(404,"Letter not found")
+
+@app.get("/campaign-leads")
+def get_campaign_leads(req: Request):
+    user=current_user(req)
+    return sender_service.available_leads(uuid.UUID(user["id"]))
+
+@app.get("/campaigns")
+def get_campaigns(req: Request):
+    user=current_user(req)
+    return sender_service.list_campaigns(uuid.UUID(user["id"]))
+
+@app.get("/campaigns/{campaign_id}/leads")
+def get_campaign_lead_selection(campaign_id: str, req: Request):
+    user=current_user(req)
+    try: cid=uuid.UUID(campaign_id)
+    except ValueError: raise HTTPException(422,"Invalid campaign id")
+    return sender_service.campaign_leads(uuid.UUID(user["id"]),cid)
+
+@app.post("/campaigns")
+def add_campaign(request: CampaignRequest, req: Request):
+    user=current_user(req)
+    uid=uuid.UUID(user["id"])
+    try: sid,lid=uuid.UUID(request.sender_id),uuid.UUID(request.letter_id)
+    except ValueError: raise HTTPException(422,"Invalid sender or letter id")
+    sender=sender_service.get_sender(uid,sid)
+    if not sender: raise HTTPException(404,"Sender not found")
+    with db() as conn:
+        letter=conn.execute("SELECT id FROM sender_letters WHERE id=%s AND user_id=%s",(lid,uid)).fetchone()
+    if not letter: raise HTTPException(404,"Letter not found")
+    try: return sender_service.create_campaign(uid,request.model_dump())
+    except ValueError as exc: raise HTTPException(400,str(exc)) from exc
+
+@app.post("/campaigns/{campaign_id}/send-test")
+def send_campaign_test(campaign_id: str, request: dict, req: Request):
+    user=current_user(req)
+    try: cid=uuid.UUID(campaign_id); lid=uuid.UUID(str(request.get("lead_id")))
+    except (ValueError,TypeError): raise HTTPException(422,"Invalid campaign or Lead id")
+    try: return sender_service.send_test_lead(uuid.UUID(user["id"]),cid,lid)
+    except LookupError as exc: raise HTTPException(404,str(exc)) from exc
+    except ValueError as exc: raise HTTPException(400,str(exc)) from exc
+    except Exception as exc: raise HTTPException(502,"SMTP send failed") from exc
+
+@app.get("/sending-summary")
+def get_sending_summary(req: Request):
+    user=current_user(req)
+    return sender_service.summary(uuid.UUID(user["id"]))
 
 @app.get("/settings/generic-mailbox-prefixes")
 def get_mailbox_prefixes(req: Request):
@@ -229,6 +411,9 @@ class WalletAdjustmentRequest(BaseModel):
 class AdminPriceRequest(BaseModel):
     amount_cents: int = Field(ge=0)
 
+class AdminPaidEnrichmentPriceRequest(BaseModel):
+    unit_micros_usd: int = Field(ge=1)
+
 class AdminResearchSettingsRequest(BaseModel):
     default_max_leads: int = Field(ge=1, le=100000)
     max_leads: int = Field(ge=1, le=100000)
@@ -269,10 +454,11 @@ def billing(req: Request):
         balance=conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s",(uid,)).fetchone()[0]
         price=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='scrap_creation_price_cents'").fetchone()[0]
         premium_price=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='premium_serp_price_cents'").fetchone()[0]
+        paid_unit=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='paid_enrichment_unit_micros_usd'").fetchone()[0]
         default_max_leads=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_default_max_leads'").fetchone()[0]
         max_leads=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_max_leads'").fetchone()[0]
         timeout_hours=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_timeout_hours'").fetchone()[0]
-    return {"balance_cents":int(balance),"scrap_creation_price_cents":int(price),"premium_serp_price_cents":int(premium_price),"research_default_max_leads":int(default_max_leads),"research_max_leads":int(max_leads),"research_timeout_hours":int(timeout_hours)}
+    return {"balance_cents":int(balance),"scrap_creation_price_cents":int(price),"premium_serp_price_cents":int(premium_price),"paid_enrichment_unit_micros_usd":int(paid_unit),"research_default_max_leads":int(default_max_leads),"research_max_leads":int(max_leads),"research_timeout_hours":int(timeout_hours)}
 
 @app.post("/admin/scrap-price")
 def set_scrap_price(amount_cents: int, req: Request):
@@ -282,6 +468,15 @@ def set_scrap_price(amount_cents: int, req: Request):
     with db() as conn:
         conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('scrap_creation_price_cents',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(amount_cents,)); conn.commit()
     return {"scrap_creation_price_cents":amount_cents}
+
+@app.post("/admin/paid-enrichment-price")
+def admin_paid_enrichment_price(request: AdminPaidEnrichmentPriceRequest, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    unit_micros = request.unit_micros_usd
+    with db() as conn:
+        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('paid_enrichment_unit_micros_usd',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(unit_micros,)); conn.commit()
+    return {"paid_enrichment_unit_micros_usd":unit_micros}
 
 @app.post("/admin/premium-serp-price")
 def admin_premium_serp_price(request: AdminPriceRequest, req: Request):
@@ -358,7 +553,7 @@ def admin_settings(req: Request):
     user=current_user(req)
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
     with db() as conn:
-        rows=conn.execute("SELECT key,value FROM app_settings WHERE key IN ('scrap_creation_price_cents','premium_serp_price_cents','serp_result_limit','research_default_max_leads','research_max_leads','research_timeout_hours')").fetchall()
+        rows=conn.execute("SELECT key,value FROM app_settings WHERE key IN ('scrap_creation_price_cents','premium_serp_price_cents','paid_enrichment_unit_micros_usd','serp_result_limit','research_default_max_leads','research_max_leads','research_timeout_hours')").fetchall()
     values={r[0]:int(r[1]) for r in rows}
     return values
 
@@ -452,35 +647,167 @@ def scrap_results(scrap_id: str, req: Request):
     with db() as conn:
         owned=conn.execute("SELECT 1 FROM scraps WHERE id=%s AND user_id=%s",(uuid.UUID(scrap_id),uuid.UUID(user["id"]))).fetchone()
         if not owned: raise HTTPException(404,"Scrap not found")
-        rows=conn.execute("SELECT id,data,created_at FROM leads WHERE scrap_id=%s ORDER BY created_at DESC",(uuid.UUID(scrap_id),)).fetchall()
-    return [{"id":str(r[0]),"data":r[1],"created_at":r[2].isoformat()} for r in rows]
+        rows=conn.execute("SELECT id,data,status,approved_at,created_at FROM leads WHERE scrap_id=%s ORDER BY created_at DESC",(uuid.UUID(scrap_id),)).fetchall()
+    return [{"id":str(r[0]),"data":r[1],"status":r[2],"approved_at":r[3].isoformat() if r[3] else None,"created_at":r[4].isoformat()} for r in rows]
 
-@app.post("/scraps/{scrap_id}/leads/{lead_id}/enrich", status_code=202)
-async def enrich_lead(scrap_id: str, lead_id: str, background_tasks: BackgroundTasks, req: Request):
+class WorkstationLeadUpdate(BaseModel):
+    data: dict
+
+
+class WorkstationLeadSelection(BaseModel):
+    lead_ids: list[str] = Field(default_factory=list)
+
+
+@app.get("/scraps/{scrap_id}/workstation")
+def lead_workstation(scrap_id: str, req: Request):
     user = current_user(req)
     sid = uuid.UUID(scrap_id)
     with db() as conn:
+        owned = conn.execute("SELECT id,name,status FROM scraps WHERE id=%s AND user_id=%s", (sid, uuid.UUID(user["id"]))).fetchone()
+        if not owned:
+            raise HTTPException(404, "Scrap not found")
+        rows = conn.execute(
+            "SELECT id,data,status,approved_at,approved_by,created_at FROM leads WHERE scrap_id=%s ORDER BY created_at,id",
+            (sid,),
+        ).fetchall()
+    leads = [
+        {"id": str(row[0]), "data": row[1], "status": row[2], "approved_at": row[3].isoformat() if row[3] else None,
+         "approved_by": str(row[4]) if row[4] else None, "created_at": row[5].isoformat()}
+        for row in rows
+    ]
+    return {
+        "scrap": {"id": str(owned[0]), "name": owned[1], "status": owned[2]},
+        "leads": leads,
+        "counts": {"total": len(leads), "working": sum(x["status"] == "working" for x in leads), "completed": sum(x["status"] == "completed" for x in leads)},
+    }
+
+
+@app.patch("/scraps/{scrap_id}/leads/{lead_id}")
+def update_workstation_lead(scrap_id: str, lead_id: str, request: WorkstationLeadUpdate, req: Request):
+    user = current_user(req)
+    sid = uuid.UUID(scrap_id); lid = uuid.UUID(lead_id); uid = uuid.UUID(user["id"])
+    with db() as conn:
         row = conn.execute(
-            "SELECT l.data FROM leads l JOIN scraps s ON s.id=l.scrap_id "
-            "WHERE l.id=%s AND l.scrap_id=%s AND s.user_id=%s",
-            (uuid.UUID(lead_id), sid, uuid.UUID(user["id"])),
+            "SELECT l.data,l.status FROM leads l JOIN scraps s ON s.id=l.scrap_id WHERE l.id=%s AND l.scrap_id=%s AND s.user_id=%s",
+            (lid, sid, uid),
         ).fetchone()
         if not row:
             raise HTTPException(404, "Lead not found")
+        if row[1] == "completed":
+            raise HTTPException(409, "Completed Leads cannot be edited")
+        data = dict(request.data or {})
+        data.pop("status", None); data.pop("approved_at", None); data.pop("approved_by", None); data.pop("id", None); data.pop("created_at", None)
+        prefixes, _ = get_client_policies(str(uid))
+        try:
+            lead = Lead.model_validate(data, context={"generic_prefixes": prefixes})
+        except Exception as exc:
+            raise HTTPException(422, f"Invalid Lead data: {exc}") from exc
+        clean = jsonable_encoder(lead.model_dump())
+        conn.execute("UPDATE leads SET data=%s WHERE id=%s AND scrap_id=%s", (Jsonb(clean), lid, sid))
+        conn.commit()
+    return {"id": lead_id, "data": clean, "status": "working"}
+
+
+@app.delete("/scraps/{scrap_id}/leads/{lead_id}", status_code=204)
+def delete_workstation_lead(scrap_id: str, lead_id: str, req: Request):
+    user = current_user(req)
+    sid = uuid.UUID(scrap_id); lid = uuid.UUID(lead_id)
+    with db() as conn:
+        owned = conn.execute(
+            "SELECT 1 FROM leads l JOIN scraps s ON s.id=l.scrap_id WHERE l.id=%s AND l.scrap_id=%s AND s.user_id=%s",
+            (lid, sid, uuid.UUID(user["id"])),
+        ).fetchone()
+        if not owned:
+            raise HTTPException(404, "Lead not found")
+        conn.execute("DELETE FROM leads WHERE id=%s AND scrap_id=%s", (lid, sid)); conn.commit()
+
+
+@app.post("/scraps/{scrap_id}/leads/{lead_id}/approve")
+def approve_workstation_lead(scrap_id: str, lead_id: str, req: Request):
+    user = current_user(req)
+    sid = uuid.UUID(scrap_id); lid = uuid.UUID(lead_id); uid = uuid.UUID(user["id"])
+    with db() as conn:
+        row = conn.execute(
+            "SELECT l.status FROM leads l JOIN scraps s ON s.id=l.scrap_id WHERE l.id=%s AND l.scrap_id=%s AND s.user_id=%s",
+            (lid, sid, uid),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Lead not found")
+        if row[0] == "completed":
+            return {"id": lead_id, "status": "completed"}
+        conn.execute("UPDATE leads SET status='completed',approved_at=now(),approved_by=%s WHERE id=%s AND scrap_id=%s", (uid, lid, sid)); conn.commit()
+    return {"id": lead_id, "status": "completed"}
+
+
+@app.post("/scraps/{scrap_id}/leads/approve")
+def approve_workstation_leads(scrap_id: str, request: WorkstationLeadSelection, req: Request):
+    user = current_user(req); sid = uuid.UUID(scrap_id); uid = uuid.UUID(user["id"])
+    lead_ids = [uuid.UUID(value) for value in request.lead_ids]
+    if not lead_ids:
+        raise HTTPException(422, "Select at least one Lead")
+    with db() as conn:
+        owned = conn.execute("SELECT 1 FROM scraps WHERE id=%s AND user_id=%s", (sid, uid)).fetchone()
+        if not owned:
+            raise HTTPException(404, "Scrap not found")
+        conn.execute("UPDATE leads SET status='completed',approved_at=now(),approved_by=%s WHERE scrap_id=%s AND id=ANY(%s) AND status='working'", (uid, sid, lead_ids))
+        conn.commit()
+    return {"approved": len(lead_ids)}
+
+
+@app.post("/scraps/{scrap_id}/enrich", status_code=202)
+async def enrich_scrap(scrap_id: str, background_tasks: BackgroundTasks, req: Request, request: EnrichmentRequest, mode: Literal["paid"] = "paid"):
+    user = current_user(req)
+    sid = uuid.UUID(scrap_id)
+    with db() as conn:
+        owned = conn.execute("SELECT 1 FROM scraps WHERE id=%s AND user_id=%s", (sid, uuid.UUID(user["id"]))).fetchone()
+        if not owned:
+            raise HTTPException(404, "Scrap not found")
         running = conn.execute(
             "SELECT 1 FROM jobs WHERE scrap_id=%s AND status IN ('queued','running') LIMIT 1",
             (sid,),
         ).fetchone()
         if running:
-            raise HTTPException(409, "Research is already running for this Scrap")
+            raise HTTPException(409, "A research or enrichment job is already running for this Scrap")
+        if mode == "paid":
+            unit_row = conn.execute("SELECT value #>> '{}' FROM app_settings WHERE key='paid_enrichment_unit_micros_usd'").fetchone()
+            if not unit_row or unit_row[0] is None:
+                raise HTTPException(409, "Paid enrichment pricing is not configured")
+            if not os.getenv("GROQ_API_KEY", "").strip():
+                raise HTTPException(409, "Paid enrichment is not configured")
+        try:
+            selected_ids = [uuid.UUID(x) for x in request.lead_ids]
+        except ValueError as exc:
+            raise HTTPException(422, "Invalid Lead ID") from exc
+        lead_rows = conn.execute("SELECT id FROM leads WHERE scrap_id=%s AND status='working' AND id=ANY(%s) ORDER BY created_at,id", (sid, selected_ids)).fetchall()
+        if len(lead_rows) != len(set(selected_ids)):
+            raise HTTPException(409, "One or more selected Leads are no longer available for enrichment")
+        if not lead_rows:
+            raise HTTPException(409, "No working Leads selected for enrichment")
         job_id = uuid.uuid4().hex
+        charged_cents = 0
+        if mode == "paid":
+            unit_micros = int(unit_row[0])
+            charged_cents = max(1, math.ceil(unit_micros * len(lead_rows) / 10000))
+            wallet = conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s FOR UPDATE", (uuid.UUID(user["id"]),)).fetchone()
+            if not wallet:
+                raise HTTPException(500, "Wallet not initialized")
+            if int(wallet[0]) < charged_cents:
+                raise HTTPException(402, f"Insufficient wallet balance for Paid Enrichment: ${charged_cents / 100:.2f} required")
+            balance_after = int(wallet[0]) - charged_cents
+            conn.execute("UPDATE wallets SET balance_cents=%s,updated_at=now() WHERE user_id=%s", (balance_after, uuid.UUID(user["id"])))
+            conn.execute("INSERT INTO wallet_transactions(id,user_id,amount_cents,balance_after_cents,transaction_type,reference_id) VALUES(%s,%s,%s,%s,'paid_enrichment',%s)", (uuid.uuid4(), uuid.UUID(user["id"]), -charged_cents, balance_after, job_id))
         conn.execute(
             "INSERT INTO jobs(id,scrap_id,status,stage,payload,result) VALUES(%s,%s,'queued','Queued',%s,%s)",
-            (uuid.UUID(job_id), sid, Jsonb({"type": "enrich_lead", "lead_id": lead_id}), Jsonb({"message": "Enrichment queued", "counts": {}, "events": []})),
+            (uuid.UUID(job_id), sid, Jsonb({"type": f"{mode}_enrichment", "lead_count": len(lead_rows), "lead_ids": [str(x[0]) for x in lead_rows], "charged_cents": charged_cents, "discover_new_leads": bool(request.discover_new_leads)}), Jsonb({"message": f"{mode.title()} enrichment queued", "counts": {}, "events": []})),
         )
         conn.commit()
-    background_tasks.add_task(_run_enrich_job, job_id, scrap_id, lead_id)
-    return {"job_id": job_id, "status": "queued", "lead_id": lead_id}
+    background_tasks.add_task(_run_enrich_scrap_job, job_id, scrap_id, mode, [str(x[0]) for x in lead_rows], request.discover_new_leads)
+    return {"job_id": job_id, "status": "queued", "mode": mode, "lead_count": len(lead_rows), "charged_cents": charged_cents, "discover_new_leads": bool(request.discover_new_leads)}
+
+
+@app.post("/scraps/{scrap_id}/leads/{lead_id}/enrich", status_code=410)
+async def enrich_lead(scrap_id: str, lead_id: str, background_tasks: BackgroundTasks, req: Request):
+    raise HTTPException(410, "Single-lead enrichment is retired. Use Paid Enrichment from the Lead Workstation.")
 
 
 @app.get("/scraps/{scrap_id}/serp-results")
@@ -892,7 +1219,7 @@ def _persist_job(job_id, **fields):
     with db() as conn:
         sets=[]; vals=[]
         for key,value in fields.items():
-            sets.append(f"{key}=%s"); vals.append(Jsonb(value) if key in ("payload","result") else value)
+            sets.append(f"{key}=%s"); vals.append(Jsonb(jsonable_encoder(value)) if key in ("payload","result") else value)
         sets.append("updated_at=now()"); vals.append(uuid.UUID(job_id))
         conn.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id=%s",vals); conn.commit()
 
@@ -901,7 +1228,15 @@ def _event_callback(job_id):
         job=JOBS.get(job_id,{"counts":{},"events":[]})
         if job_id in CANCEL_FLAGS:
             return
-        job["stage"]=event.stage; job["message"]=event.message; job["counts"].update(event.counts); job["events"].append(event.__dict__); job["events"]=job["events"][-250:]
+        job["stage"]=event.stage; job["message"]=event.message
+        if event.stage != "Telemetry":
+            if event.stage == "Leads" and event.message == "Paid enrichment result":
+                job["counts"]["_current_leads_enriched"] = int(event.counts.get("leads_enriched", 0))
+                job["counts"]["_current_new_leads"] = int(event.counts.get("new_leads", 0))
+                job["counts"]["fields_changed"] = int(job["counts"].get("fields_changed", 0)) + int(event.counts.get("fields_changed", 0))
+            else:
+                job["counts"].update(event.counts)
+        job["events"].append(event.__dict__); job["events"]=job["events"][-250:]
         JOBS[job_id]=job
         _persist_job(job_id,status="running",stage=event.stage,result={"counts":job["counts"],"message":event.message,"events":job["events"],"lead_count":job["counts"].get("leads",job.get("lead_count",0))})
     return on_event
@@ -909,7 +1244,7 @@ def _event_callback(job_id):
 def _job_from_row(row):
     job_id,status,stage,payload,result,created_at,updated_at=row
     result=result or {}; payload=payload or {}
-    return {"job_id":str(job_id),"status":status,"stage":stage,"message":result.get("message", ""),"counts":result.get("counts",{}),"events":result.get("events",[]),"lead_count":result.get("lead_count",0),"export_format":payload.get("export_format","csv"),"output":result.get("output"),"error":result.get("error"),"created_at":created_at.isoformat() if created_at else None,"updated_at":updated_at.isoformat() if updated_at else None}
+    return {"job_id":str(job_id),"status":status,"stage":stage,"payload":payload,"message":result.get("message", ""),"counts":result.get("counts",{}),"events":result.get("events",[]),"lead_count":result.get("lead_count",0),"export_format":payload.get("export_format","csv"),"output":result.get("output"),"error":result.get("error"),"created_at":created_at.isoformat() if created_at else None,"updated_at":updated_at.isoformat() if updated_at else None}
 
 def _load_job(job_id, user_id=None):
     try: jid=uuid.UUID(job_id)
@@ -948,10 +1283,11 @@ def _run_job(job_id,request):
             from src.exports.google_sheets import export_google_sheets
             result=export_google_sheets(leads,request.google_spreadsheet_id,worksheet=request.google_worksheet)
         else: result=_write_export(leads,job_id,request.export_format)
+        snapshot=JOBS[job_id]
+        _persist_job(job_id,status="running",stage="Export",result={"message":"Export generated; completing research","lead_count":len(leads),"output":result,"counts":snapshot.get("counts",{}),"events":snapshot.get("events",[])})
         if job_id in CANCEL_FLAGS:
             return
         JOBS[job_id].update(status="completed",lead_count=len(leads),output=result)
-        snapshot=JOBS[job_id]
         _persist_job(job_id,status="completed",stage="Export",result={"lead_count":len(leads),"output":result,"counts":snapshot.get("counts",{}),"events":snapshot.get("events",[])})
         with db() as conn: conn.execute("UPDATE scraps SET status='completed',completed_at=now() WHERE id=%s",(uuid.UUID(request.scrap_id),)); conn.commit()
         if request.scrap_id:
@@ -971,6 +1307,123 @@ def _persist_leads(scrap_id, leads):
         return
     for lead in leads:
         persist_lead(scrap_id, lead)
+
+def _mark_enrichment_provider_called(job_id):
+    with db() as conn:
+        conn.execute(
+            "UPDATE jobs SET payload = jsonb_set(COALESCE(payload,'{}'::jsonb), '{provider_called}', 'true'::jsonb, true) WHERE id=%s",
+            (uuid.UUID(job_id),),
+        )
+        conn.commit()
+
+
+def _refund_enrichment_if_provider_not_called(job_id, scrap_id):
+    sid = uuid.UUID(scrap_id)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT s.user_id,j.payload FROM jobs j JOIN scraps s ON s.id=j.scrap_id WHERE j.id=%s FOR UPDATE",
+            (uuid.UUID(job_id),),
+        ).fetchone()
+        if not row:
+            return False
+        user_id, payload = row
+        payload = payload or {}
+        if payload.get("provider_called") or payload.get("refund_applied"):
+            return False
+        charged_cents = int(payload.get("charged_cents") or 0)
+        if charged_cents <= 0:
+            return False
+        wallet = conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s FOR UPDATE", (user_id,)).fetchone()
+        if not wallet:
+            return False
+        new_balance = int(wallet[0]) + charged_cents
+        conn.execute("UPDATE wallets SET balance_cents=%s,updated_at=now() WHERE user_id=%s", (new_balance, user_id))
+        conn.execute(
+            "INSERT INTO wallet_transactions(id,user_id,amount_cents,balance_after_cents,transaction_type,reference_id) VALUES(%s,%s,%s,%s,'paid_enrichment_no_provider',%s)",
+            (uuid.uuid4(), user_id, charged_cents, new_balance, job_id),
+        )
+        payload["refund_applied"] = True
+        conn.execute("UPDATE jobs SET payload=%s WHERE id=%s", (Jsonb(payload), uuid.UUID(job_id)))
+        conn.commit()
+        return True
+
+
+def _run_enrich_scrap_job(job_id, scrap_id, mode, lead_ids, discover_new_leads=False):
+    try:
+        sid = uuid.UUID(scrap_id)
+        with db() as conn:
+            row = conn.execute(
+                "SELECT s.user_id,s.criteria,s.crawler_config FROM scraps s WHERE s.id=%s",
+                (sid,),
+            ).fetchone()
+            lead_rows = conn.execute(
+                "SELECT id,data FROM leads WHERE scrap_id=%s AND status='working' AND id=ANY(%s) ORDER BY created_at,id",
+                (sid, [uuid.UUID(x) for x in lead_ids]),
+            ).fetchall()
+        if not row:
+            raise RuntimeError("Scrap not found")
+        user_id, raw_criteria, raw_crawler = row
+        criteria = SearchCriteria.model_validate(raw_criteria or {})
+        crawler = CrawlerConfig.model_validate(raw_crawler or {})
+        prefixes, rules = get_client_policies(str(user_id))
+        JOBS[job_id] = {
+            "job_id": job_id, "status": "running", "stage": "Starting",
+            "message": f"{mode.title()} enrichment started", "counts": {
+                "leads_seeded": len(lead_rows), "leads_discovered": 0, "leads_enriched": 0,
+                "evidence": 0, "pages_collected": 0,
+                "firecrawl_search_requests": 0, "firecrawl_scrape_requests": 0,
+                "firecrawl_pages_collected": 0, "firecrawl_estimated_credits": 0,
+                "llm_calls": 0, "llm_input_tokens": 0, "llm_output_tokens": 0,
+                "llm_reasoning_tokens": 0, "llm_cost_usd": 0.0,
+            }, "events": [], "lead_count": 0,
+        }
+        _persist_job(job_id, status="running", stage="Starting", result={"message": f"{mode.title()} enrichment started", "counts": JOBS[job_id]["counts"], "events": []})
+        sink = JobEventSink(_event_callback(job_id))
+        pipeline = LeadDiscoveryPipeline(
+            crawler_config=crawler,
+            generic_prefixes=prefixes,
+            domain_rules=rules,
+            llm_call_counter=lambda: _increment_llm_calls(scrap_id),
+        )
+        all_results = []
+        for index, lead_row in enumerate(lead_rows, 1):
+            if job_id in CANCEL_FLAGS:
+                break
+            lead = Lead.model_construct(**(lead_row[1] or {}))
+            emit_event(sink, "Enrichment", f"Processing lead {index}/{len(lead_rows)}", lead_id=str(lead_row[0]), mode=mode)
+            if mode == "paid":
+                results, firecrawl_usage, llm_usage = asyncio.run(pipeline.enrich_lead_paid(criteria, lead, event_sink=sink, scrap_id=scrap_id, cancel_check=lambda: job_id in CANCEL_FLAGS, provider_started=lambda: _mark_enrichment_provider_called(job_id), discover_new_leads=discover_new_leads))
+                counts = JOBS[job_id]["counts"]
+                counts["firecrawl_search_requests"] += int(firecrawl_usage.get("search_requests", 0))
+                counts["firecrawl_scrape_requests"] += int(firecrawl_usage.get("scrape_requests", 0))
+                counts["firecrawl_pages_collected"] += int(firecrawl_usage.get("pages_collected", 0))
+                counts["firecrawl_estimated_credits"] += int(firecrawl_usage.get("estimated_credits", 0))
+                counts["llm_calls"] += int(llm_usage.get("calls", 0))
+                counts["llm_input_tokens"] += int(llm_usage.get("input_tokens", 0))
+                counts["llm_output_tokens"] += int(llm_usage.get("output_tokens", 0))
+                counts["llm_reasoning_tokens"] += int(llm_usage.get("reasoning_tokens", 0))
+                counts["llm_cost_usd"] += float(llm_usage.get("cost_usd", 0.0))
+                counts["leads_enriched"] += int(counts.get("_current_leads_enriched", 0))
+                counts["leads_discovered"] += int(counts.get("_current_new_leads", 0))
+                counts.pop("_current_leads_enriched", None); counts.pop("_current_new_leads", None)
+            else:
+                results = asyncio.run(pipeline.enrich_lead(criteria, lead, event_sink=sink, scrap_id=scrap_id, cancel_check=lambda: job_id in CANCEL_FLAGS))
+            all_results.extend(results)
+            JOBS[job_id]["lead_count"] = JOBS[job_id]["counts"].get("leads_enriched", 0) + JOBS[job_id]["counts"].get("leads_discovered", 0)
+            _persist_job(job_id, status="running", stage="Enrichment", result={"message": f"{mode.title()} enrichment running", "counts": JOBS[job_id]["counts"], "events": JOBS[job_id]["events"]})
+        status = "canceled" if job_id in CANCEL_FLAGS else "completed"
+        JOBS[job_id]["status"] = status
+        JOBS[job_id]["stage"] = "Complete" if status == "completed" else "Canceled"
+        JOBS[job_id]["message"] = f"{mode.title()} enrichment {status}"
+        _persist_job(job_id, status=status, stage=JOBS[job_id]["stage"], result={"message": JOBS[job_id]["message"], "counts": JOBS[job_id]["counts"], "events": JOBS[job_id]["events"], "lead_count": JOBS[job_id]["lead_count"]})
+    except Exception as exc:
+        if mode == "paid":
+            _refund_enrichment_if_provider_not_called(job_id, scrap_id)
+        JOBS.setdefault(job_id, {"job_id": job_id, "counts": {}, "events": []})
+        JOBS[job_id].update(status="failed", stage="Failed", message=f"{mode.title()} enrichment failed", error=str(exc))
+        snapshot = JOBS[job_id]
+        _persist_job(job_id, status="failed", stage="Failed", result={"error": str(exc), "message": snapshot.get("message"), "counts": snapshot.get("counts", {}), "events": snapshot.get("events", [])})
+
 
 def _run_enrich_job(job_id, scrap_id, lead_id):
     try:
@@ -1051,15 +1504,17 @@ def _run_url_job(job_id,request):
         with db() as conn: conn.execute("UPDATE scraps SET status='running' WHERE id=%s AND status IN ('active','submitted')",(uuid.UUID(request.scrap_id),)); conn.commit()
         sink=JobEventSink(_event_callback(job_id))
         leads=asyncio.run(LeadDiscoveryPipeline(crawler_config=request.crawler, generic_prefixes=get_client_policies(user_id)[0], domain_rules=get_client_policies(user_id)[1]).run_harvested(request.criteria,request.results or [{"url":u} for u in request.urls],event_sink=sink,scrap_id=request.scrap_id,cancel_check=lambda: job_id in CANCEL_FLAGS))
-        _persist_leads(request.scrap_id,leads)
+        snapshot=JOBS[job_id]
+        _persist_job(job_id,status="running",stage="Finalizing",result={"message":"Lead set returned; finalizing research","lead_count":len(leads),"counts":snapshot.get("counts",{}),"events":snapshot.get("events",[])})
         if request.export_format=="google_sheets":
             from src.exports.google_sheets import export_google_sheets
             result=export_google_sheets(leads,request.google_spreadsheet_id,worksheet=request.google_worksheet)
         else: result=_write_export(leads,job_id,request.export_format)
+        snapshot=JOBS[job_id]
+        _persist_job(job_id,status="running",stage="Export",result={"message":"Export generated; completing research","lead_count":len(leads),"output":result,"counts":snapshot.get("counts",{}),"events":snapshot.get("events",[])})
         if job_id in CANCEL_FLAGS:
             return
         JOBS[job_id].update(status="completed",lead_count=len(leads),output=result)
-        snapshot=JOBS[job_id]
         _persist_job(job_id,status="completed",stage="Export",result={"lead_count":len(leads),"output":result,"counts":snapshot.get("counts",{}),"events":snapshot.get("events",[])})
         with db() as conn: conn.execute("UPDATE scraps SET status='completed',completed_at=now() WHERE id=%s",(uuid.UUID(request.scrap_id),)); conn.commit()
         if request.scrap_id:
@@ -1113,7 +1568,7 @@ async def create_job(request: JobRequest,background_tasks: BackgroundTasks, req:
     with db() as conn:
         if not conn.execute("SELECT 1 FROM scraps WHERE id=%s AND user_id=%s",(uuid.UUID(request.scrap_id),uuid.UUID(user["id"]))).fetchone(): raise HTTPException(404,"Scrap not found")
     job_id=uuid.uuid4().hex; JOBS[job_id]={"job_id":job_id,"status":"queued","stage":"Queued","message":"Job queued","counts":{},"events":[],"lead_count":0,"export_format":request.export_format}
-    with db() as conn: conn.execute("INSERT INTO jobs(id,scrap_id,status,stage,payload,result) VALUES(%s,%s,%s,%s,%s,%s)",(uuid.UUID(job_id),uuid.UUID(request.scrap_id),"queued","Queued",Jsonb(request.model_dump()),Jsonb({"message":"Job queued","counts":{},"events":[]})));conn.commit()
+    with db() as conn: conn.execute("INSERT INTO jobs(id,scrap_id,status,stage,payload,result) VALUES(%s,%s,%s,%s,%s,%s)",(uuid.UUID(job_id),uuid.UUID(request.scrap_id),"queued","Queued",Jsonb(request.model_dump(mode="json")),Jsonb({"message":"Job queued","counts":{},"events":[]})));conn.commit()
     background_tasks.add_task(_run_job,job_id,request); return JOBS[job_id]
 
 @app.post("/jobs/from-urls",status_code=202)
@@ -1129,9 +1584,9 @@ async def create_url_job(request: UrlImportRequest,background_tasks: BackgroundT
     request.criteria=SearchCriteria.model_validate(row[1] or {})
     request.crawler=CrawlerConfig.model_validate(row[2] or {})
     request.results=[SerpResult(url=r[0],title=r[1] or '',snippet=r[2] or '',raw_text=r[3] or '',provider=r[4],page_url=r[5]) for r in serp_rows]
-    request.urls=[r.url for r in request.results]
+    request.urls=[str(r.url) for r in request.results]
     job_id=uuid.uuid4().hex; JOBS[job_id]={"job_id":job_id,"status":"queued","stage":"Queued","message":"URL crawl queued","counts":{},"events":[],"lead_count":0,"export_format":request.export_format}
-    with db() as conn: conn.execute("INSERT INTO jobs(id,scrap_id,status,stage,payload,result) VALUES(%s,%s,%s,%s,%s,%s)",(uuid.UUID(job_id),uuid.UUID(request.scrap_id),"queued","Queued",Jsonb(request.model_dump()),Jsonb({"message":"URL crawl queued","counts":{},"events":[]})));conn.commit()
+    with db() as conn: conn.execute("INSERT INTO jobs(id,scrap_id,status,stage,payload,result) VALUES(%s,%s,%s,%s,%s,%s)",(uuid.UUID(job_id),uuid.UUID(request.scrap_id),"queued","Queued",Jsonb(request.model_dump(mode="json")),Jsonb({"message":"URL crawl queued","counts":{},"events":[]})));conn.commit()
     background_tasks.add_task(_run_url_job,job_id,request); return JOBS[job_id]
 
 @app.get("/scraps/{scrap_id}/job")

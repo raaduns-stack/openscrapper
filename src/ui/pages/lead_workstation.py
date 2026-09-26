@@ -2,6 +2,7 @@ import pandas as pd
 import streamlit as st
 
 from src.ui.components.header import render_header
+from src.models.lead import PROTECTED_LEAD_FIELDS
 
 
 def render_lead_workstation(api, api_json, billing, api_error):
@@ -107,7 +108,12 @@ def render_lead_workstation(api, api_json, billing, api_error):
                 row={'Select':select_all,'Lead ID':str(item['id'])}
                 row.update({field:item['data'].get(field) for field in editable_fields})
                 rows.append(row)
-            editor=st.data_editor(pd.DataFrame(rows),use_container_width=True,hide_index=True,num_rows='fixed',key=selection_key,column_config={'Select':st.column_config.CheckboxColumn('Select'),'Lead ID':None})
+            field_labels={field: field.replace('_',' ').title() + (' *' if field in PROTECTED_LEAD_FIELDS else '') for field in editable_fields}
+            editor_config={'Select':st.column_config.CheckboxColumn('Select'),'Lead ID':None}
+            editor_config.update({field:st.column_config.TextColumn(field_labels[field]) for field in editable_fields})
+            editor=st.data_editor(pd.DataFrame(rows),use_container_width=True,hide_index=True,num_rows='fixed',key=selection_key,column_config=editor_config)
+            if PROTECTED_LEAD_FIELDS:
+                st.caption('Fields marked * are protected from automatic scraping/enrichment. Manual Lead editing remains allowed.')
             selected_ids=[str(row['Lead ID']) for _,row in editor.iterrows() if bool(row.get('Select',False)) and str(row['Lead ID']) in working_by_id]
             if selected_ids:
                 selected_labels=[f"{working_by_id[lead_id]['data'].get('first_name') or ''} {working_by_id[lead_id]['data'].get('last_name') or ''}".strip() for lead_id in selected_ids]

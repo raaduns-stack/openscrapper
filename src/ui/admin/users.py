@@ -10,7 +10,6 @@ def toggle_admin_user(user_id):
     else: selected.discard(user_id)
 
 def render_users(api, api_json, api_error, **kwargs):
-    with admin_tabs[2]:
         st.subheader('Users')
         st.caption('Delete test or unwanted accounts. Deletion cascades all owned data. The logged-in admin cannot delete itself.')
         try:

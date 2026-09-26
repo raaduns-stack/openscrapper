@@ -444,7 +444,28 @@ Recommended generic frontend handling:
 14. All user-owned API requests include authentication.
 15. The UI must not implement search-engine CAPTCHA solving or bypassing.
 
-## 16. Backend implementation notes
+## 16. Senders API
+### GET/POST /senders
+Authenticated. Sender records are user-owned. POST accepts display_name, email, provider (smtp, gmail_oauth, microsoft_oauth), enabled, config, and an optional SMTP password/app-password. Secrets are write-only and never returned.
+### PATCH/DELETE /senders/{sender_id}
+Authenticated and ownership checked. PATCH updates non-secret sender metadata/config; DELETE removes the sender.
+### POST /senders/{sender_id}/test
+Authenticated and ownership checked. SMTP senders can be connection-tested. Provider credentials are never returned.
+### GET/POST /letters and DELETE /letters/{letter_id}
+Authenticated and user-owned. Letters contain name, subject, plain-text body, optional HTML, personalization variable names, and active state.
+### GET /campaign-leads
+Authenticated. Returns completed Leads owned by the authenticated user and eligible for campaign selection.
+### GET/POST /campaigns
+Authenticated and user-owned. Campaign creation requires sender and letter records owned by the same user, plus at least one selected completed Lead. Request includes `lead_ids: string[]`. New campaigns start as draft.
+### GET /campaigns/{campaign_id}/leads
+Authenticated and ownership checked. Returns the Leads assigned to the campaign.
+### POST /campaigns/{campaign_id}/send-test
+Authenticated and ownership checked. Sends exactly one explicitly selected campaign Lead through an SMTP sender. Draft campaigns only. The operation is idempotent per campaign/Lead test key and records sent/failed state; uncertain `sending` state is not automatically retried.
+### GET /sending-summary
+Authenticated. Returns persisted sender, campaign, and message summary metrics.
+OAuth authorization flows and automated outbound sending are not yet enabled by this implementation slice.
+
+## 17. Backend implementation notes
 
 The API contract intentionally exposes normalized business objects rather than internal crawler/provider implementation details. Frontend code must not depend on Python module names, database tables, process-local dictionaries, or provider-specific HTTP APIs.
 

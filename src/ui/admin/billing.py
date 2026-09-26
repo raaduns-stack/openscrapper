@@ -1,4 +1,3 @@
-import requests
 import streamlit as st
 
 def render_billing(api, api_json, api_error, **kwargs):
