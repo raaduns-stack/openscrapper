@@ -5,7 +5,7 @@ import streamlit as st
 API = os.getenv('API_URL', 'http://127.0.0.1:8000').rstrip('/')
 
 
-def render_sidebar(api_json=None):
+def render_sidebar(api_json=None, auth_cookies=None):
     billing = None
     with st.sidebar:
         st.title('Scrappee')
@@ -53,6 +53,8 @@ def render_sidebar(api_json=None):
                 if token:
                     requests.post(f'{API}/auth/logout', headers={'Authorization': f'Bearer {token}'}, timeout=10)
             finally:
+                if auth_cookies:
+                    auth_cookies.remove('scrappee_web_session',path='/',secure=True,same_site='lax')
                 st.session_state.clear()
                 st.rerun()
 

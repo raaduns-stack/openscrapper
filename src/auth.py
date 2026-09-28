@@ -11,6 +11,7 @@ from src.db import db
 SECRET = os.getenv("SCRAPPEE_AUTH_SECRET", "change-me-in-production")
 ALGORITHM = "HS256"
 SESSION_IDLE_MINUTES = int(os.getenv("SCRAPPEE_SESSION_IDLE_MINUTES", "20"))
+PERSISTENT_SESSION_DAYS = int(os.getenv("SCRAPPEE_PERSISTENT_SESSION_DAYS", "30"))
 password_hash = PasswordHash.recommended()
 
 def hash_token(token): return hashlib.sha256(token.encode()).hexdigest()
@@ -24,7 +25,7 @@ def create_user(email, password):
     return str(user_id)
 
 def create_session(user_id, persistent=False):
-    raw=secrets.token_urlsafe(48); expires=datetime.now(timezone.utc)+(timedelta(days=36525) if persistent else timedelta(minutes=SESSION_IDLE_MINUTES))
+    raw=secrets.token_urlsafe(48); expires=datetime.now(timezone.utc)+(timedelta(days=PERSISTENT_SESSION_DAYS) if persistent else timedelta(minutes=SESSION_IDLE_MINUTES))
     with db() as conn:
         conn.execute("INSERT INTO sessions(id,user_id,token_hash,expires_at,persistent) VALUES(%s,%s,%s,%s,%s)",(uuid.uuid4(),user_id,hash_token(raw),expires,persistent)); conn.commit()
     return raw, expires

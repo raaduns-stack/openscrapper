@@ -19,6 +19,19 @@ CREATE TABLE IF NOT EXISTS wallets (
 CREATE TABLE IF NOT EXISTS wallet_transactions (
  id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, amount_cents BIGINT NOT NULL, balance_after_cents BIGINT NOT NULL, transaction_type TEXT NOT NULL, reference_id TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(user_id, transaction_type, reference_id)
 );
+CREATE TABLE IF NOT EXISTS wallet_deposits (
+ id UUID PRIMARY KEY,
+ user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ btcpay_invoice_id TEXT UNIQUE NOT NULL,
+ requested_cents BIGINT NOT NULL CHECK(requested_cents > 0),
+ paid_btc NUMERIC(24,12),
+ status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','settled','expired','invalid')),
+ settled_at TIMESTAMPTZ,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_wallet_deposits_user ON wallet_deposits(user_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_wallet_deposits_status ON wallet_deposits(status,updated_at);
 CREATE TABLE IF NOT EXISTS app_settings (
  key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -40,9 +53,20 @@ CREATE TABLE IF NOT EXISTS scraps (
 );
 ALTER TABLE scraps ADD COLUMN IF NOT EXISTS llm_calls BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE serp_results ADD COLUMN IF NOT EXISTS raw_text TEXT;
-CREATE TABLE IF NOT EXISTS search_parameters (
- id UUID PRIMARY KEY, scrap_id UUID NOT NULL REFERENCES scraps(id) ON DELETE CASCADE, parameter_id TEXT NOT NULL, provider TEXT NOT NULL, query TEXT NOT NULL, url TEXT NOT NULL, family TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(scrap_id, parameter_id)
+CREATE TABLE IF NOT EXISTS search_template_categories (
+ id UUID PRIMARY KEY, name TEXT NOT NULL UNIQUE, active BOOLEAN NOT NULL DEFAULT true, position INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS search_templates (
+ id UUID PRIMARY KEY, category_id UUID NOT NULL REFERENCES search_template_categories(id) ON DELETE CASCADE, provider TEXT NOT NULL CHECK(provider IN ('google','bing')), family TEXT NOT NULL, template TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT true, position INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS search_parameters (
+ id UUID PRIMARY KEY, scrap_id UUID NOT NULL REFERENCES scraps(id) ON DELETE CASCADE, parameter_id TEXT NOT NULL, provider TEXT NOT NULL, query TEXT NOT NULL, url TEXT NOT NULL, family TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, category TEXT NOT NULL DEFAULT '', template_id UUID, variables JSONB NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending', completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(scrap_id, parameter_id)
+);
+ALTER TABLE search_parameters ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE search_parameters ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+ALTER TABLE search_parameters ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT '';
+ALTER TABLE search_parameters ADD COLUMN IF NOT EXISTS template_id UUID;
+ALTER TABLE search_parameters ADD COLUMN IF NOT EXISTS variables JSONB NOT NULL DEFAULT '{}';
 CREATE TABLE IF NOT EXISTS serp_sessions (
  token TEXT PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE, scrap_id UUID REFERENCES scraps(id) ON DELETE CASCADE, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), expires_at TIMESTAMPTZ NOT NULL, urls JSONB NOT NULL DEFAULT '[]', results JSONB NOT NULL DEFAULT '[]', imports JSONB NOT NULL DEFAULT '[]', sources JSONB NOT NULL DEFAULT '[]'
 );
@@ -88,6 +112,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
 CREATE INDEX IF NOT EXISTS idx_generic_mailbox_user ON generic_mailbox_prefixes(user_id, prefix);
 CREATE INDEX IF NOT EXISTS idx_domain_rules_user ON domain_rules(user_id, domain);
 CREATE INDEX IF NOT EXISTS idx_search_parameters_scrap ON search_parameters(scrap_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_search_parameters_queue ON search_parameters(scrap_id, category, status, position);
 CREATE INDEX IF NOT EXISTS idx_serp_results_scrap ON serp_results(scrap_id, captured_at);
 CREATE INDEX IF NOT EXISTS idx_premium_serp_user ON premium_serp_extractions(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_serp_sessions_expiry ON serp_sessions(expires_at);
@@ -126,6 +151,7 @@ CREATE TABLE IF NOT EXISTS sender_campaign_leads (
  PRIMARY KEY(campaign_id,lead_id)
 );
 CREATE INDEX IF NOT EXISTS idx_sender_campaign_leads_user ON sender_campaign_leads(user_id,campaign_id);
+ALTER TABLE sender_accounts ALTER COLUMN email DROP NOT NULL;
 CREATE TABLE IF NOT EXISTS sender_messages (
  id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  campaign_id UUID REFERENCES sender_campaigns(id) ON DELETE SET NULL,
@@ -137,8 +163,8 @@ CREATE TABLE IF NOT EXISTS sender_messages (
 );
 CREATE TABLE IF NOT EXISTS sender_oauth_states (
  state TEXT PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
- sender_id UUID NOT NULL REFERENCES sender_accounts(id) ON DELETE CASCADE,
- provider TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+ sender_id UUID REFERENCES sender_accounts(id) ON DELETE CASCADE,
+ provider TEXT NOT NULL, display_name TEXT, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_sender_oauth_states_expiry ON sender_oauth_states(expires_at);
 CREATE INDEX IF NOT EXISTS idx_sender_accounts_user ON sender_accounts(user_id,created_at DESC);
@@ -156,6 +182,10 @@ def db():
 def init_db():
     with db() as conn:
         conn.execute(SCHEMA)
+        conn.execute("ALTER TABLE sender_oauth_states ALTER COLUMN sender_id DROP NOT NULL")
+        conn.execute("ALTER TABLE sender_oauth_states ADD COLUMN IF NOT EXISTS display_name TEXT")
+        conn.execute("DELETE FROM sender_accounts WHERE provider='gmail_oauth' AND email IS NULL AND NOT (config ? 'oauth_email')")
+        conn.execute("UPDATE sender_accounts SET config=config || '{\"throttle_seconds\":60}'::jsonb WHERE provider='smtp' AND NOT (config ? 'throttle_seconds')")
         conn.execute("ALTER TABLE sender_messages DROP CONSTRAINT IF EXISTS sender_messages_status_check")
         conn.execute("ALTER TABLE sender_messages ADD CONSTRAINT sender_messages_status_check CHECK(status IN ('queued','sending','sent','failed','replied'))")
         conn.execute("ALTER TABLE leads DROP CONSTRAINT IF EXISTS leads_status_check")
@@ -177,6 +207,9 @@ def init_db():
         conn.execute("INSERT INTO premium_provider_configs(provider,enabled,is_default,settings) VALUES('serpapi',false,false,'{\"endpoint\":\"https://serpapi.com/search.json\",\"timeout\":30}'::jsonb) ON CONFLICT(provider) DO NOTHING")
         conn.execute("INSERT INTO premium_provider_configs(provider,enabled,is_default,settings) VALUES('brightdata',false,false,'{\"endpoint\":\"https://api.brightdata.com/request\",\"zone\":\"serp_api1\",\"timeout\":30}'::jsonb) ON CONFLICT(provider) DO NOTHING")
         conn.execute("INSERT INTO wallets(user_id) SELECT id FROM users ON CONFLICT(user_id) DO NOTHING")
+        conn.execute("INSERT INTO search_template_categories(id,name,position) VALUES(gen_random_uuid(),'People',1),(gen_random_uuid(),'Contact',2),(gen_random_uuid(),'Company',3),(gen_random_uuid(),'Keyword',4),(gen_random_uuid(),'Broad',5) ON CONFLICT(name) DO NOTHING")
+        conn.execute("INSERT INTO search_templates(id,category_id,provider,family,template,position) SELECT gen_random_uuid(),c.id,'google',x.family,x.template,x.position FROM (VALUES ('People','people','{product} {role} {geography} contact',1),('Contact','contact','{product} {geography} email',2),('Company','company','{product} {geography} company contact',3),('Keyword','keyword-contact','{product} {keyword} {geography} contact',4),('Broad','broad','{product} {geography}',5)) AS x(category,family,template,position) JOIN search_template_categories c ON c.name=x.category WHERE NOT EXISTS (SELECT 1 FROM search_templates t WHERE t.category_id=c.id AND t.provider='google')")
+        conn.execute("INSERT INTO search_templates(id,category_id,provider,family,template,position) SELECT gen_random_uuid(),c.id,'bing',x.family,x.template,x.position FROM (VALUES ('People','people','{product} {role} {geography} contact',1),('Contact','contact','{product} {geography} email',2),('Company','company','{product} {geography} company contact',3),('Keyword','keyword-email','{product} {keyword} {geography} email',4),('Broad','broad','{product} {geography}',5)) AS x(category,family,template,position) JOIN search_template_categories c ON c.name=x.category WHERE NOT EXISTS (SELECT 1 FROM search_templates t WHERE t.category_id=c.id AND t.provider='bing')")
         conn.execute("ALTER TABLE scraps ADD COLUMN IF NOT EXISTS crawler_config JSONB NOT NULL DEFAULT '{}'::jsonb")
         conn.execute("ALTER TABLE search_parameters ADD COLUMN IF NOT EXISTS position INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE crawl_pages ADD COLUMN IF NOT EXISTS error TEXT")

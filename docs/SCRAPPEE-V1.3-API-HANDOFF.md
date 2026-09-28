@@ -446,17 +446,25 @@ Recommended generic frontend handling:
 
 ## 16. Senders API
 ### GET/POST /senders
-Authenticated. Sender records are user-owned. POST accepts display_name, email, provider (smtp, gmail_oauth, microsoft_oauth), enabled, config, and an optional SMTP password/app-password. Secrets are write-only and never returned.
+Authenticated. Sender records are user-owned. POST creates non-SMTP provider records only; SMTP senders must use the test-and-save creation boundary below. Secrets are write-only and never returned.
+### POST /senders/test-and-save
+Authenticated and ownership checked. New SMTP configuration is connection-tested before any sender row is inserted. A failed connection creates no sender record. A successful connection is persisted with `health='healthy'`. Duplicate sender email returns a conflict without creating a row.
 ### PATCH/DELETE /senders/{sender_id}
 Authenticated and ownership checked. PATCH updates non-secret sender metadata/config; DELETE removes the sender.
 ### POST /senders/{sender_id}/test
 Authenticated and ownership checked. SMTP senders can be connection-tested. Provider credentials are never returned.
+### POST /senders/{sender_id}/test-and-save
+Authenticated and ownership checked. SMTP configuration is connection-tested first and persisted only when the connection succeeds. Supports the per-sender `config.throttle_seconds` interval.
+### PATCH /senders/{sender_id}/reply-to
+Authenticated and ownership checked. Updates only the sender-level Reply-To configuration. Request body is `{ "reply_to": "address@example.com" }`; `null` or an empty value clears the custom Reply-To and restores sender-email fallback.
 ### GET/POST /letters and DELETE /letters/{letter_id}
 Authenticated and user-owned. Letters contain name, subject, plain-text body, optional HTML, personalization variable names, and active state.
+### GET /campaign-audiences
+Authenticated. Returns reusable user-owned Lead Groups / Search Groups with their completed-Lead counts. The current implementation exposes existing Scrap audiences as the reusable group boundary and does not return group membership.
 ### GET /campaign-leads
-Authenticated. Returns completed Leads owned by the authenticated user and eligible for campaign selection.
+Authenticated. Returns a bounded set of completed Leads owned by the authenticated user for compatibility and small/custom audience workflows; it must not be used to load a large audience into the browser.
 ### GET/POST /campaigns
-Authenticated and user-owned. Campaign creation requires sender and letter records owned by the same user, plus at least one selected completed Lead. Request includes `lead_ids: string[]`. New campaigns start as draft.
+Authenticated and user-owned. Campaign creation requires sender and letter records owned by the same user. A campaign may select an existing Lead Group / Search Group with `audience_scrap_id`, or use bounded individual `lead_ids` for a custom audience. Group selection stores the audience reference rather than copying all group members into campaign rows. New campaigns start as draft. `config.sender_name` stores the editable campaign-specific From display name and is distinct from the reusable sender account display name. `config.sender_ids` stores the complete selected sender pool; `sender_id` remains the primary sender reference for backward compatibility. `config.reply_to` is the single campaign Reply-To value; it defaults from the selected primary sender when the UI initializes it. Sender-pool selection does not yet define rotation, load balancing, failover, or distribution semantics.
 ### GET /campaigns/{campaign_id}/leads
 Authenticated and ownership checked. Returns the Leads assigned to the campaign.
 ### POST /campaigns/{campaign_id}/send-test

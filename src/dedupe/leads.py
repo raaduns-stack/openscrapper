@@ -135,11 +135,15 @@ def persist_lead(scrap_id, lead: Lead, evidence_id=None) -> bool:
                 "country", "city", "state", "email", "phone", "website",
                 "source_url",
             ):
-                if is_protected_lead_field(field):
-                    continue
                 value = lead_data.get(field)
-                if value not in (None, ""):
-                    merged[field] = value
+                if value in (None, ""):
+                    continue
+                # Protected fields cannot be overwritten once populated, but an
+                # extractor may legitimately populate an empty protected field.
+                # This keeps the enrichment gate from breaking initial SERP/Scrapy capture.
+                if is_protected_lead_field(field) and existing_data.get(field) not in (None, ""):
+                    continue
+                merged[field] = value
             if existing_data.get("capture_stage", "scrapy") != lead.capture_stage:
                 merged["capture_stage"] = "serp+scrapy"
             conn.execute(
@@ -149,12 +153,10 @@ def persist_lead(scrap_id, lead: Lead, evidence_id=None) -> bool:
             lead_id = existing[0]
             created = False
         else:
-            gated_data = strip_protected_lead_fields(dict(data))
-            if gated_data != data:
-                try:
-                    gated_data = Lead.model_validate(gated_data).model_dump(mode="json")
-                except Exception:
-                    return False
+            # Protected fields are protected against overwrite, not against the
+            # first authoritative capture. SERP/Scrapy extraction must be able to
+            # create a Lead containing a discovered email/phone.
+            gated_data = dict(data)
             lead_id = uuid.uuid4()
             conn.execute(
                 "INSERT INTO leads(id,scrap_id,data) VALUES(%s,%s,%s)",

@@ -28,8 +28,9 @@ class QueryInterpreter:
                 retries=2,
                 system_prompt=(
                     "Translate a customer's lead-generation request into SearchCriteria. "
-                    "Extract industry, product, geography, target_type, roles, keywords, and max_leads. "
-                    "Do not invent constraints. If a field is not stated, leave it empty or use the schema default. "
+                    "Extract industry, product, geography, target_type, roles, and keywords. "
+                    "Do not extract or invent a max_leads value; the application administrator controls the lead limit. "
+                    "If a field is not stated, leave it empty or use the schema default. "
                     "When the request seeks people, interpret job functions and commercial roles such as buyer, "
                     "seller, trader, broker, importer, exporter, procurement manager, purchasing manager, director, "
                     "manager, and CEO as roles, not merely keywords, and set target_type to people. "

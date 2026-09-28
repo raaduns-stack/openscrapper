@@ -43,10 +43,39 @@ class GeographyResolver:
                     else: state = None
                 break
 
+        # If country is missing, infer it only when the supplied state/city
+        # maps unambiguously to one country in the bundled geography data.
         if not country:
-            return {"city": city, "state": state, "country": country}
+            if state:
+                state_matches = []
+                for record in self.states:
+                    for item in record.get("states", []):
+                        if self._norm(item.get("name")) == self._norm(state):
+                            state_matches.append((record.get("id"), item))
+                if len(state_matches) == 1:
+                    country_id = state_matches[0][0]
+                    country_record = next((c for c in self.countries if c.get("id") == country_id), None)
+                    country = country_record.get("name") if country_record else None
+            if not country and city:
+                city_matches = []
+                for record in self.cities:
+                    country_id = record.get("id")
+                    for item in record.get("states", []):
+                        for city_item in item.get("cities", []):
+                            if self._norm(city_item.get("name")) == self._norm(city):
+                                city_matches.append((country_id, item.get("id"), city_item))
+                country_ids = {match[0] for match in city_matches}
+                if len(country_ids) == 1:
+                    country_id = next(iter(country_ids))
+                    country_record = next((c for c in self.countries if c.get("id") == country_id), None)
+                    country = country_record.get("name") if country_record else None
+                    if not state and len(city_matches) == 1:
+                        state_id = city_matches[0][1]
+                        state_record = next((r for r in self.states if r.get("id") == country_id), None)
+                        state_item = next((s for s in (state_record.get("states", []) if state_record else []) if s.get("id") == state_id), None)
+                        state = state_item.get("name") if state_item else None
 
-        country_record = self._country_index.get(self._norm(country))
+        country_record = self._country_index.get(self._norm(country)) if country else None
         if not country_record:
             return {"city": city, "state": state, "country": country}
         country = country_record.get("name")
@@ -83,14 +112,76 @@ class GeographyResolver:
                     break
             if matched_city:
                 city = str(matched_city.get("name")).strip()
-            else:
-                city = None
+            elif city:
+                # Some datasets expose a major city as a state/province name
+                # rather than repeating it in the city list. Preserve that
+                # verified city and use the matching state instead of dropping it.
+                state_name_match = state_by_name.get(self._norm(city))
+                if state_name_match:
+                    state = str(state_name_match.get("name")).strip()
+                else:
+                    city = None
 
         return {"city": city, "state": state, "country": country}
 
     def _load(self, filename: str):
         with open(self.data_dir / filename, "r", encoding="utf-8") as f:
             return json.load(f)
+
+    def resolve_values(self, value: str) -> list[str]:
+        """Resolve country/state/city input into verified geography values.
+
+        Country expands to country + states + cities; state expands to state + cities;
+        city remains the verified city. Ambiguous or unknown values are preserved.
+        """
+        raw = str(value or "").strip()
+        if not raw:
+            return [""]
+        norm = self._norm(raw)
+
+        if norm in self._country_index:
+            result = self.resolve(raw)
+            values = [result.country]
+            for state in result.states:
+                values.append(state.name)
+                values.extend(state.cities)
+            return list(dict.fromkeys(v for v in values if v))
+
+        state_matches = []
+        for country in self.countries:
+            country_id = country.get("id")
+            state_record = next((r for r in self.states if r.get("id") == country_id), None)
+            for state in (state_record.get("states", []) if state_record else []):
+                if self._norm(state.get("name")) == norm:
+                    state_matches.append((country_id, state))
+
+        if len(state_matches) == 1:
+            country_id, state = state_matches[0]
+            city_record = next((r for r in self.cities if r.get("id") == country_id), None)
+            city_states = {
+                item.get("id"): item.get("cities", [])
+                for item in (city_record.get("states", []) if city_record else [])
+            }
+            cities = sorted({
+                str(city.get("name")).strip()
+                for city in city_states.get(state.get("id"), [])
+                if city.get("name")
+            })
+            return list(dict.fromkeys([str(state.get("name")).strip(), *cities]))
+
+        city_matches = []
+        for country in self.countries:
+            country_id = country.get("id")
+            city_record = next((r for r in self.cities if r.get("id") == country_id), None)
+            for state in (city_record.get("states", []) if city_record else []):
+                for city in state.get("cities", []):
+                    if self._norm(city.get("name")) == norm:
+                        city_matches.append(city.get("name"))
+
+        if len(set(city_matches)) == 1:
+            return [str(city_matches[0]).strip()]
+
+        return [raw]
 
     def resolve(self, country_name: str) -> GeographyResult:
         country = next(

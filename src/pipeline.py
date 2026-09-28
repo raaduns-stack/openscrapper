@@ -535,6 +535,26 @@ class LeadDiscoveryPipeline:
                     country = country_match.group(1).strip()
                     country = {"us": "United States", "usa": "United States", "uk": "United Kingdom"}.get(country.casefold(), country)
 
+        # LinkedIn SERP records frequently expose location as "Location: City ..."
+        # without country/state. Use the geography repository to canonicalize it
+        # and infer missing upstream geography only when the match is unambiguous.
+        if not country and is_linkedin_person:
+            linkedin_prefix = host.split(".", 1)[0].casefold()
+            if len(linkedin_prefix) == 2:
+                country_record = next(
+                    (item for item in _GEOGRAPHY.countries if str(item.get("iso2", "")).casefold() == linkedin_prefix),
+                    None,
+                )
+                if country_record:
+                    country = country_record.get("name")
+
+        if not city and is_linkedin_person:
+            linkedin_location = _re.search(r"\bLocation:\s*([^\n·|]+)", evidence_text, _re.I)
+            if linkedin_location:
+                city = linkedin_location.group(1).strip()
+                city = _re.sub(r"\s+Metropolitan\s+Area$", "", city, flags=_re.I).strip()
+                city = _re.sub(r"^Greater\s+", "", city, flags=_re.I).strip()
+
         # Validate/canonicalize extracted location against the bundled geography hierarchy.
         geo = _GEOGRAPHY.classify(city=city, state=state, country=country)
         city, state, country = geo["city"], geo["state"], geo["country"]

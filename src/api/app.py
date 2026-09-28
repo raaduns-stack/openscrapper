@@ -16,11 +16,14 @@ from src.pipeline import LeadDiscoveryPipeline
 from src.dedupe.leads import persist_lead
 from src.observability.job_events import JobEventSink, emit_event
 from src.search.strategy import SearchStrategyEngine
+from src.search.template_engine import SearchTemplateEngine, VARIABLES
 from src.search.premium import HttpPremiumSerpProvider, parse_search_url, SUPPORTED_PROVIDERS, provider_statuses, save_provider_config
 from src.db import db, init_db, purge_expired_history, get_client_policies
 from src.auth import create_user, login_user, current_user, create_session
+from src.payments_btcpay import configured as btcpay_configured, create_invoice as btcpay_create_invoice, verify_webhook as btcpay_verify_webhook, payment_btc as btcpay_payment_btc
 import hashlib
 from psycopg.types.json import Jsonb
+from psycopg.errors import UniqueViolation
 from src.senders import service as sender_service
 from src.senders import gmail as gmail_oauth
 
@@ -125,8 +128,14 @@ class EnrichmentRequest(BaseModel):
 
 class SenderRequest(BaseModel):
     display_name: str = Field(min_length=1,max_length=200)
-    email: str = Field(min_length=3,max_length=320)
+    email: str | None = Field(default=None,min_length=3,max_length=320)
     provider: Literal["smtp","gmail_oauth","microsoft_oauth"]
+
+    @model_validator(mode='after')
+    def validate_sender_identity(self):
+        if self.provider == 'smtp' and not self.email:
+            raise ValueError('Sender email is required for SMTP senders')
+        return self
     enabled: bool = True
     config: dict = Field(default_factory=dict)
     password: str | None = Field(default=None,max_length=500)
@@ -137,6 +146,9 @@ class SenderUpdateRequest(BaseModel):
     enabled: bool | None = None
     config: dict | None = None
     password: str | None = Field(default=None,max_length=500)
+
+class ReplyToRequest(BaseModel):
+    reply_to: str | None = Field(default=None,max_length=320)
 
 class LetterRequest(BaseModel):
     name: str = Field(min_length=1,max_length=200)
@@ -150,19 +162,31 @@ class CampaignRequest(BaseModel):
     name: str = Field(min_length=1,max_length=200)
     sender_id: str
     letter_id: str
-    lead_ids: list[str] = Field(min_length=1,max_length=10000)
+    lead_ids: list[str] = Field(default_factory=list,max_length=10000)
+    audience_scrap_id: str | None = None
     config: dict = Field(default_factory=dict)
+
+class SearchTemplateCategoryRequest(BaseModel):
+    name: str = Field(min_length=1,max_length=100)
+    active: bool = True
+
+class SearchTemplateRequest(BaseModel):
+    category_id: str
+    provider: Literal["google","bing"]
+    family: str = Field(min_length=1,max_length=100)
+    template: str = Field(min_length=1,max_length=2000)
+    active: bool = True
 
 @app.post("/auth/register")
 def register(request: AuthRequest):
     try: user_id=create_user(request.email,request.password)
     except Exception as exc: raise HTTPException(409,"Email already registered") from exc
-    token,expires=login_user(request.email,request.password)
+    token,expires=login_user(request.email,request.password,persistent=True)
     return {"user_id":user_id,"email":request.email.lower().strip(),"token":token,"expires_at":expires.isoformat()}
 
 @app.post("/auth/login")
 def login(request: AuthRequest, req: Request):
-    persistent=req.headers.get("X-Scrappee-Extension") == "1"
+    persistent=True
     token,expires=login_user(request.email,request.password,persistent=persistent)
     return {"email":request.email.lower().strip(),"token":token,"expires_at":expires.isoformat()}
 
@@ -202,12 +226,32 @@ def get_sender_config(sender_id: str, req: Request):
 @app.post("/senders")
 def add_sender(request: SenderRequest, req: Request):
     user=current_user(req)
+    if request.provider == 'gmail_oauth':
+        raise HTTPException(400,"Gmail senders are created only after successful Google authorization")
+    if request.provider == 'smtp':
+        raise HTTPException(400,"SMTP senders must be tested and saved together")
     try:
         return sender_service.create_sender(uuid.UUID(user["id"]),request.model_dump(exclude_none=True))
     except RuntimeError as exc:
         raise HTTPException(503,str(exc)) from exc
+    except UniqueViolation as exc:
+        raise HTTPException(409,"A sender with this email already exists. Open the existing sender and use EDIT or TEST.") from exc
     except Exception as exc:
-        raise HTTPException(400,"Could not create sender") from exc
+        raise HTTPException(400,"Could not create sender. Check the sender details and try again.") from exc
+
+@app.post("/senders/test-and-save")
+def test_and_save_new_sender(request: SenderRequest, req: Request):
+    user=current_user(req)
+    if request.provider != 'smtp':
+        raise HTTPException(400,"This endpoint is only for SMTP senders")
+    try:
+        return sender_service.test_and_create_smtp(uuid.UUID(user["id"]),request.model_dump(exclude_none=True))
+    except UniqueViolation as exc:
+        raise HTTPException(409,"A sender with this email already exists. Open the existing sender and use EDIT or TEST.") from exc
+    except (LookupError,ValueError) as exc:
+        raise HTTPException(400,str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502,f"SMTP connection failed: {exc}") from exc
 
 @app.patch("/senders/{sender_id}")
 def patch_sender(sender_id: str, request: SenderUpdateRequest, req: Request):
@@ -217,6 +261,18 @@ def patch_sender(sender_id: str, request: SenderUpdateRequest, req: Request):
     row=sender_service.update_sender(uuid.UUID(user["id"]),sid,request.model_dump(exclude_none=True))
     if not row: raise HTTPException(404,"Sender not found")
     return row
+
+@app.patch("/senders/{sender_id}/reply-to")
+def patch_sender_reply_to(sender_id: str, request: ReplyToRequest, req: Request):
+    user=current_user(req)
+    try: sid=uuid.UUID(sender_id)
+    except ValueError: raise HTTPException(422,"Invalid sender id")
+    try:
+        row=sender_service.update_reply_to(uuid.UUID(user["id"]),sid,request.reply_to)
+        if not row: raise HTTPException(404,"Sender not found")
+        return row
+    except LookupError as exc: raise HTTPException(404,str(exc)) from exc
+    except ValueError as exc: raise HTTPException(400,str(exc)) from exc
 
 @app.delete("/senders/{sender_id}",status_code=204)
 def remove_sender(sender_id: str, req: Request):
@@ -234,16 +290,24 @@ def test_sender(sender_id: str, req: Request):
     except LookupError as exc: raise HTTPException(404,str(exc))
     except Exception as exc: raise HTTPException(502,f"Sender connection failed: {exc}") from exc
 
-@app.get("/senders/{sender_id}/oauth/gmail/start")
-def start_gmail_oauth(sender_id: str, req: Request):
+@app.post("/senders/{sender_id}/test-and-save")
+def test_and_save_sender(sender_id: str, request: SenderUpdateRequest, req: Request):
     user=current_user(req)
     try: sid=uuid.UUID(sender_id)
     except ValueError: raise HTTPException(422,"Invalid sender id")
-    row=sender_service.sender_config(uuid.UUID(user["id"]),sid)
-    if not row: raise HTTPException(404,"Sender not found")
-    if row["provider"]!="gmail_oauth": raise HTTPException(400,"Sender is not configured for Gmail OAuth")
+    try: return sender_service.test_and_update_smtp(uuid.UUID(user["id"]),sid,request.model_dump(exclude_none=True))
+    except LookupError as exc: raise HTTPException(404,str(exc))
+    except ValueError as exc: raise HTTPException(400,str(exc))
+    except Exception as exc: raise HTTPException(502,f"SMTP connection failed: {exc}") from exc
+
+class GmailOAuthStartRequest(BaseModel):
+    display_name: str = Field(default="Gmail",min_length=1,max_length=200)
+
+@app.post("/oauth/gmail/start")
+def start_gmail_oauth(request: GmailOAuthStartRequest, req: Request):
+    user=current_user(req)
     try:
-        return {"authorization_url":gmail_oauth.start(uuid.UUID(user["id"]),sid)}
+        return {"authorization_url":gmail_oauth.start(uuid.UUID(user["id"]),request.display_name)}
     except RuntimeError as exc: raise HTTPException(503,str(exc)) from exc
 
 @app.get("/oauth/gmail/callback",include_in_schema=False)
@@ -283,6 +347,11 @@ def remove_letter(letter_id: str, req: Request):
     try: lid=uuid.UUID(letter_id)
     except ValueError: raise HTTPException(422,"Invalid letter id")
     if not sender_service.delete_letter(uuid.UUID(user["id"]),lid): raise HTTPException(404,"Letter not found")
+
+@app.get("/campaign-audiences")
+def get_campaign_audiences(req: Request):
+    user=current_user(req)
+    return sender_service.campaign_audiences(uuid.UUID(user["id"]))
 
 @app.get("/campaign-leads")
 def get_campaign_leads(req: Request):
@@ -447,6 +516,108 @@ def admin_premium_provider(provider: str, request: AdminPremiumProviderRequest, 
     except ValueError as exc: raise HTTPException(422,str(exc)) from exc
     return next(x for x in provider_statuses() if x["provider"]==provider)
 
+@app.get("/admin/search-template-categories")
+def admin_search_template_categories(req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        rows=conn.execute("SELECT id,name,active,position FROM search_template_categories ORDER BY position,name").fetchall()
+    return [{"id":str(r[0]),"name":r[1],"active":r[2],"position":r[3]} for r in rows]
+
+@app.post("/admin/search-template-categories")
+def admin_add_search_template_category(request: SearchTemplateCategoryRequest, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        try:
+            row=conn.execute("INSERT INTO search_template_categories(id,name,active,position) VALUES(gen_random_uuid(),%s,%s,(SELECT COALESCE(MAX(position),0)+1 FROM search_template_categories)) RETURNING id,name,active,position",(request.name.strip(),request.active)).fetchone()
+            conn.commit()
+        except UniqueViolation as exc:
+            raise HTTPException(409,"Category already exists") from exc
+    return {"id":str(row[0]),"name":row[1],"active":row[2],"position":row[3]}
+
+@app.get("/admin/search-template-categories/{category_id}/templates")
+def admin_search_templates(category_id: str, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        rows=conn.execute("SELECT id,provider,family,template,active,position FROM search_templates WHERE category_id=%s ORDER BY position,created_at",(uuid.UUID(category_id),)).fetchall()
+    return [{"id":str(r[0]),"provider":r[1],"family":r[2],"template":r[3],"active":r[4],"position":r[5]} for r in rows]
+
+@app.post("/admin/search-templates")
+def admin_add_search_template(request: SearchTemplateRequest, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    if any(v not in VARIABLES for v in __import__("re").findall(r"{([a-z_]+)}",request.template)):
+        raise HTTPException(422,"Template contains an unsupported variable")
+    with db() as conn:
+        exists=conn.execute("SELECT 1 FROM search_template_categories WHERE id=%s",(uuid.UUID(request.category_id),)).fetchone()
+        if not exists: raise HTTPException(404,"Search template category not found")
+        row=conn.execute("INSERT INTO search_templates(id,category_id,provider,family,template,active,position) VALUES(gen_random_uuid(),%s,%s,%s,%s,%s,(SELECT COALESCE(MAX(position),0)+1 FROM search_templates WHERE category_id=%s)) RETURNING id,provider,family,template,active,position",(uuid.UUID(request.category_id),request.provider,request.family.strip(),request.template.strip(),request.active,uuid.UUID(request.category_id))).fetchone()
+        conn.commit()
+    return {"id":str(row[0]),"provider":row[1],"family":row[2],"template":row[3],"active":row[4],"position":row[5]}
+
+@app.patch("/admin/search-templates/{template_id}")
+def admin_patch_search_template(template_id: str, request: dict, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    tid=uuid.UUID(template_id)
+    with db() as conn:
+        row=conn.execute("SELECT category_id FROM search_templates WHERE id=%s",(tid,)).fetchone()
+        if not row: raise HTTPException(404,"Search template not found")
+        if "active" in request:
+            conn.execute("UPDATE search_templates SET active=%s WHERE id=%s",(bool(request["active"]),tid))
+        if "provider" in request:
+            provider=str(request["provider"]).strip().lower()
+            if provider not in ("google","bing"): raise HTTPException(422,"Unsupported search provider")
+            conn.execute("UPDATE search_templates SET provider=%s WHERE id=%s",(provider,tid))
+        if "family" in request:
+            family=str(request["family"]).strip()
+            if not family: raise HTTPException(422,"Family cannot be empty")
+            conn.execute("UPDATE search_templates SET family=%s WHERE id=%s",(family,tid))
+        if "template" in request:
+            template=str(request["template"]).strip()
+            if not template: raise HTTPException(422,"Template cannot be empty")
+            if any(v not in VARIABLES for v in __import__("re").findall(r"{([a-z_]+)}",template)): raise HTTPException(422,"Template contains an unsupported variable")
+            conn.execute("UPDATE search_templates SET template=%s WHERE id=%s",(template,tid))
+        if "position" in request:
+            target=max(0,int(request["position"]))
+            ids=[r[0] for r in conn.execute("SELECT id FROM search_templates WHERE category_id=%s ORDER BY position,created_at",(row[0],)).fetchall()]
+            if tid in ids:
+                target=min(target,len(ids)-1); ids.remove(tid); ids.insert(target,tid)
+                for position,item_id in enumerate(ids): conn.execute("UPDATE search_templates SET position=%s WHERE id=%s",(position,item_id))
+        conn.commit()
+    return {"id":template_id}
+
+@app.patch("/admin/search-template-categories/{category_id}")
+def admin_patch_search_template_category(category_id: str, request: dict, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    cid=uuid.UUID(category_id)
+    with db() as conn:
+        exists=conn.execute("SELECT 1 FROM search_template_categories WHERE id=%s",(cid,)).fetchone()
+        if not exists: raise HTTPException(404,"Search template category not found")
+        if "active" in request: conn.execute("UPDATE search_template_categories SET active=%s WHERE id=%s",(bool(request["active"]),cid))
+        if "name" in request:
+            name=str(request["name"]).strip()
+            if not name: raise HTTPException(422,"Category name cannot be empty")
+            conn.execute("UPDATE search_template_categories SET name=%s WHERE id=%s",(name,cid))
+        if "position" in request:
+            target=max(0,int(request["position"]))
+            ids=[r[0] for r in conn.execute("SELECT id FROM search_template_categories ORDER BY position,name").fetchall()]
+            if cid in ids:
+                target=min(target,len(ids)-1); ids.remove(cid); ids.insert(target,cid)
+                for position,item_id in enumerate(ids): conn.execute("UPDATE search_template_categories SET position=%s WHERE id=%s",(position,item_id))
+        conn.commit()
+    return {"id":category_id}
+
+@app.delete("/admin/search-templates/{template_id}",status_code=204)
+def admin_delete_search_template(template_id: str, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        conn.execute("DELETE FROM search_templates WHERE id=%s",(uuid.UUID(template_id),)); conn.commit()
+
 @app.get("/billing")
 def billing(req: Request):
     user=current_user(req); uid=uuid.UUID(user["id"])
@@ -459,6 +630,78 @@ def billing(req: Request):
         max_leads=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_max_leads'").fetchone()[0]
         timeout_hours=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_timeout_hours'").fetchone()[0]
     return {"balance_cents":int(balance),"scrap_creation_price_cents":int(price),"premium_serp_price_cents":int(premium_price),"paid_enrichment_unit_micros_usd":int(paid_unit),"research_default_max_leads":int(default_max_leads),"research_max_leads":int(max_leads),"research_timeout_hours":int(timeout_hours)}
+
+class BtcPayDepositRequest(BaseModel):
+    amount_cents: int = Field(gt=0, le=100000000)
+
+
+@app.post("/billing/deposits/btcpay")
+def create_btcpay_deposit(request: BtcPayDepositRequest, req: Request):
+    user = current_user(req)
+    if not btcpay_configured():
+        raise HTTPException(503, "BTCPay is not configured")
+    uid = uuid.UUID(user["id"])
+    deposit_id = uuid.uuid4()
+    order_id = str(deposit_id)
+    try:
+        invoice = btcpay_create_invoice(f"{request.amount_cents / 100:.2f}", order_id)
+    except Exception as exc:
+        raise HTTPException(502, "Could not create BTCPay invoice") from exc
+    invoice_id = str(invoice.get("id") or "").strip()
+    checkout_url = str(invoice.get("checkoutLink") or invoice.get("checkoutUrl") or "").strip()
+    if not invoice_id or not checkout_url:
+        raise HTTPException(502, "BTCPay returned an incomplete invoice")
+    with db() as conn:
+        conn.execute("INSERT INTO wallet_deposits(id,user_id,btcpay_invoice_id,requested_cents,status) VALUES(%s,%s,%s,%s,'pending')", (deposit_id, uid, invoice_id, request.amount_cents))
+        conn.commit()
+    return {"deposit_id": str(deposit_id), "invoice_id": invoice_id, "requested_cents": request.amount_cents, "checkout_url": checkout_url, "invoice": invoice}
+
+
+@app.get("/billing/deposits")
+def list_btcpay_deposits(req: Request):
+    user = current_user(req)
+    with db() as conn:
+        rows = conn.execute("SELECT id,btcpay_invoice_id,requested_cents,paid_btc,status,settled_at,created_at FROM wallet_deposits WHERE user_id=%s ORDER BY created_at DESC LIMIT 50", (uuid.UUID(user["id"]),)).fetchall()
+    return [{"id": str(r[0]), "invoice_id": r[1], "requested_cents": int(r[2]), "paid_btc": str(r[3]) if r[3] is not None else None, "status": r[4], "settled_at": r[5].isoformat() if r[5] else None, "created_at": r[6].isoformat()} for r in rows]
+
+
+@app.post("/billing/deposits/btcpay/webhook")
+async def btcpay_webhook(req: Request):
+    raw = await req.body()
+    if not btcpay_verify_webhook(raw, req.headers.get("BTCPay-Sig", "")):
+        raise HTTPException(401, "Invalid BTCPay signature")
+    try:
+        payload = await req.json()
+    except Exception as exc:
+        raise HTTPException(400, "Invalid webhook payload") from exc
+    event_type = str(payload.get("type") or "")
+    invoice_id = str(payload.get("invoiceId") or "").strip()
+    if not invoice_id:
+        return {"ok": True, "ignored": True}
+    if event_type not in {"InvoiceProcessing", "InvoiceSettled", "InvoiceExpired", "InvoiceInvalid"}:
+        return {"ok": True, "ignored": True}
+    with db() as conn:
+        row = conn.execute("SELECT id,user_id,requested_cents,paid_btc,status FROM wallet_deposits WHERE btcpay_invoice_id=%s FOR UPDATE", (invoice_id,)).fetchone()
+        if not row:
+            return {"ok": True, "ignored": True}
+        deposit_id, uid, requested_cents, paid_btc, current_status = row
+        if event_type == "InvoiceSettled" and current_status != "settled":
+            amount_btc = btcpay_payment_btc(payload)
+            balance = conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s FOR UPDATE", (uid,)).fetchone()
+            if not balance: raise HTTPException(500, "Wallet not initialized")
+            new_balance = int(balance[0]) + int(requested_cents)
+            conn.execute("UPDATE wallets SET balance_cents=%s,updated_at=now() WHERE user_id=%s", (new_balance, uid))
+            conn.execute("INSERT INTO wallet_transactions(id,user_id,amount_cents,balance_after_cents,transaction_type,reference_id) VALUES(%s,%s,%s,%s,'btcpay_deposit',%s) ON CONFLICT(user_id,transaction_type,reference_id) DO NOTHING", (uuid.uuid4(), uid, requested_cents, new_balance, str(deposit_id)))
+            conn.execute("UPDATE wallet_deposits SET status='settled',paid_btc=%s,settled_at=now(),updated_at=now() WHERE id=%s", (amount_btc, deposit_id))
+        elif event_type == "InvoiceProcessing" and current_status == "pending":
+            conn.execute("UPDATE wallet_deposits SET status='processing',updated_at=now() WHERE id=%s", (deposit_id,))
+        elif event_type == "InvoiceExpired" and current_status not in ('settled',):
+            conn.execute("UPDATE wallet_deposits SET status='expired',updated_at=now() WHERE id=%s", (deposit_id,))
+        elif event_type == "InvoiceInvalid" and current_status not in ('settled',):
+            conn.execute("UPDATE wallet_deposits SET status='invalid',updated_at=now() WHERE id=%s", (deposit_id,))
+        conn.commit()
+    return {"ok": True}
+
 
 @app.post("/admin/scrap-price")
 def set_scrap_price(amount_cents: int, req: Request):
@@ -874,7 +1117,7 @@ class JobRequest(BaseModel):
 
 class SearchParameterRequest(BaseModel):
     criteria: SearchCriteria
-    max_queries: int=Field(default=20,ge=1,le=500)
+    max_queries: int|None=None
     scrap_id: str|None=None
 
 class SerpSessionRequest(BaseModel):
@@ -1098,14 +1341,17 @@ def download_export(scrap_id: str, export_id: str, req: Request):
 @app.post("/search/parameters")
 def search_parameters(request: SearchParameterRequest, req: Request):
     user=current_user(req) if request.scrap_id else None
-    params=SearchStrategyEngine().generate(request.criteria,request.max_queries)
-    if request.scrap_id:
-        with db() as conn:
+    with db() as conn:
+        from src.search.provider_google import GoogleQueryAdapter
+        from src.search.provider_bing import BingQueryAdapter
+        engine=SearchTemplateEngine(conn, {"google":GoogleQueryAdapter(), "bing":BingQueryAdapter()})
+        params=engine.generate(request.criteria,request.max_queries)
+        if request.scrap_id:
             owned=conn.execute("SELECT 1 FROM scraps WHERE id=%s AND user_id=%s",(uuid.UUID(request.scrap_id),uuid.UUID(user["id"]))).fetchone()
             if not owned: raise HTTPException(404,"Scrap not found")
             conn.execute("DELETE FROM search_parameters WHERE scrap_id=%s",(uuid.UUID(request.scrap_id),))
-            for position, item in enumerate(params):
-                conn.execute("INSERT INTO search_parameters(id,scrap_id,parameter_id,provider,query,url,family,position) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",(uuid.uuid4(),uuid.UUID(request.scrap_id),item.id,item.provider,item.query,item.url,item.family,position))
+            for position,item in enumerate(params):
+                conn.execute("INSERT INTO search_parameters(id,scrap_id,parameter_id,provider,query,url,family,position,category,template_id,variables,status,completed_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',NULL)",(uuid.uuid4(),uuid.UUID(request.scrap_id),item.id,item.provider,item.query,item.url,item.family,position,item.category,uuid.UUID(item.template_id),Jsonb(item.variables)))
             conn.commit()
     return {"parameters":[p.__dict__ for p in params]}
 
@@ -1113,8 +1359,19 @@ def search_parameters(request: SearchParameterRequest, req: Request):
 def scrap_search_parameters(scrap_id: str, req: Request):
     user=current_user(req)
     with db() as conn:
-        rows=conn.execute("SELECT parameter_id,provider,query,url,family FROM search_parameters WHERE scrap_id=%s AND EXISTS (SELECT 1 FROM scraps WHERE id=%s AND user_id=%s) ORDER BY position",(uuid.UUID(scrap_id),uuid.UUID(scrap_id),uuid.UUID(user["id"]))).fetchall()
-    return [{"id":r[0],"provider":r[1],"query":r[2],"url":r[3],"family":r[4]} for r in rows]
+        rows=conn.execute("SELECT p.parameter_id,p.provider,p.query,p.url,p.family,p.category,p.template_id,p.variables,p.status,p.completed_at FROM search_parameters p LEFT JOIN search_template_categories c ON c.name=p.category WHERE p.scrap_id=%s AND EXISTS (SELECT 1 FROM scraps WHERE id=%s AND user_id=%s) ORDER BY COALESCE(c.position,999999),p.position",(uuid.UUID(scrap_id),uuid.UUID(scrap_id),uuid.UUID(user["id"]))).fetchall()
+    return [{"id":r[0],"provider":r[1],"query":r[2],"url":r[3],"family":r[4],"category":r[5],"template_id":str(r[6]) if r[6] else None,"variables":r[7],"status":r[8],"completed_at":r[9].isoformat() if r[9] else None} for r in rows]
+
+@app.post("/scraps/{scrap_id}/search-parameters/{parameter_id}/complete")
+def complete_search_parameter(scrap_id: str, parameter_id: str, req: Request):
+    user=current_user(req); sid=uuid.UUID(scrap_id)
+    with db() as conn:
+        row=conn.execute("SELECT status FROM search_parameters WHERE scrap_id=%s AND parameter_id=%s AND EXISTS (SELECT 1 FROM scraps WHERE id=%s AND user_id=%s)",(sid,parameter_id,sid,uuid.UUID(user["id"]))).fetchone()
+        if not row: raise HTTPException(404,"Search parameter not found")
+        conn.execute("UPDATE search_parameters SET status='completed',completed_at=now() WHERE scrap_id=%s AND parameter_id=%s",(sid,parameter_id))
+        completed_at=conn.execute("SELECT completed_at FROM search_parameters WHERE scrap_id=%s AND parameter_id=%s",(sid,parameter_id)).fetchone()[0]
+        conn.commit()
+    return {"scrap_id":scrap_id,"parameter_id":parameter_id,"status":"completed","completed_at":completed_at.isoformat()}
 
 @app.get("/scraps/{scrap_id}/serp-session")
 def scrap_serp_session(scrap_id: str, req: Request):

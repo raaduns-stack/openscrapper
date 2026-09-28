@@ -17,7 +17,16 @@ def render_current_scrap(api, api_json, refresh_current, billing, job_telemetry,
         refresh_current()
     if not st.session_state.parameters:
         rr=api('GET',f'/scraps/{st.session_state.scrap_id}/search-parameters')
-        if rr.ok: st.session_state.parameters=rr.json()
+        if rr.ok:
+            st.session_state.parameters=rr.json()
+        if not st.session_state.parameters and live_data.get('status') in ('active','running'):
+            try:
+                criteria=live_data.get('criteria') or {}
+                pr=api('POST','/search/parameters',json={'scrap_id':st.session_state.scrap_id,'criteria':criteria})
+                pr.raise_for_status()
+                st.session_state.parameters=pr.json().get('parameters',[])
+            except Exception as exc:
+                st.error(f'Could not generate search queue: {exc}')
     try:
         live=live_data
         serp_results=api_json('GET',f'/scraps/{st.session_state.scrap_id}/serp-results')
@@ -37,8 +46,18 @@ def render_current_scrap(api, api_json, refresh_current, billing, job_telemetry,
     if current_job: st.session_state.job=current_job['job_id']
     st.header(live.get('name') or 'Current Scrap')
     st.caption(f"Status: **{live['status'].title()}** · Scrap ID: `{live['id']}`")
-    if st.button('↻ Refresh Current Scrap',key='refresh-current'):
-        st.rerun()
+    top_refresh, top_cancel = st.columns([1, 1])
+    with top_refresh:
+        if st.button('↻ Refresh Current Scrap',key='refresh-current',use_container_width=True):
+            st.rerun()
+    with top_cancel:
+        if live['status'] in ('active','running') and st.button('CANCEL SCRAP',key='cancel-current-scrap-top',use_container_width=True):
+            try:
+                r=api('POST',f"/scraps/{st.session_state.scrap_id}/cancel"); r.raise_for_status()
+                st.session_state.scrap_id=None; st.session_state.serp_token=None; st.session_state.parameters=[]; st.session_state.selected=[]; st.session_state.job=None; st.session_state.manual_sources=[]
+                st.session_state.nav_page='New Scrap'; st.rerun()
+            except Exception as exc:
+                st.error(f'Could not cancel Current Scrap: {exc}')
     st.info('Work on this Scrap until you have finished collecting Google/Bing results. Your collection is saved to Scrappee as it arrives.')
     candidate_count=(current_job or {}).get('counts',{}).get('lead_candidates',0)
     final_count=live['counts']['leads']
@@ -64,14 +83,38 @@ def render_current_scrap(api, api_json, refresh_current, billing, job_telemetry,
         st.stop()
     st.subheader('1. Collect SERP results')
     st.caption('Choose a search below. Manual search is free; Premium extracts a pasted Google/Bing search URL for the configured fee.')
-    left,right=st.columns(2)
-    with left:
+    collection_tabs=st.tabs(['Manual SERP Discovery — Free','Premium SERP Extraction'])
+    with collection_tabs[0]:
         st.markdown('### Manual SERP Discovery — Free')
         st.caption('Open Google/Bing in your normal browser. Use the extension to capture rendered result cards.')
         if st.session_state.parameters:
+            categories=[]
             for p in st.session_state.parameters:
-                cols=st.columns([1,8,2]);provider=p['provider'].lower();label='Google' if provider=='google' else 'Bing';cols[0].write(label);cols[1].text_area('Search query',p['query'],height=90,key=f"query-{p['id']}",label_visibility='collapsed');cols[2].link_button(f'Open in {label}',p['url'],use_container_width=True)
-    with right:
+                category=p.get('category') or 'Uncategorized'
+                if category not in categories: categories.append(category)
+            tabs=st.tabs(categories)
+            for tab,category in zip(tabs,categories):
+                with tab:
+                    category_rows=[p for p in st.session_state.parameters if (p.get('category') or 'Uncategorized')==category]
+                    pending=[p for p in category_rows if p.get('status','pending')!='completed']
+                    completed=len(category_rows)-len(pending)
+                    st.caption(f"{completed} completed · {len(pending)} pending · showing up to 5")
+                    for p in pending[:5]:
+                        provider=p['provider'].lower();label='Google' if provider=='google' else 'Bing'
+                        cols=st.columns([1,8,2],gap='large')
+                        cols[0].write(f'**{label}**')
+                        cols[1].text_area('Search query',p['query'],height=100,key=f"query-{p['id']}",label_visibility='collapsed')
+                        with cols[2]:
+                            st.link_button(f'Open in {label}',p['url'],use_container_width=True)
+                            if st.button('Complete search',key=f"complete-{p['id']}",use_container_width=True):
+                                r=api('POST',f"/scraps/{st.session_state.scrap_id}/search-parameters/{p['id']}/complete")
+                                r.raise_for_status()
+                                p['status']='completed'
+                                p['completed_at']=r.json().get('completed_at')
+                                st.rerun()
+                    if not pending:
+                        st.success('All searches in this category are complete.')
+    with collection_tabs[1]:
         premium_price_cents=(billing or {}).get('premium_serp_price_cents',100)
         premium_price=f'${premium_price_cents/100:.2f}'
         st.markdown(f'### Premium SERP Extraction — {premium_price} per extraction')

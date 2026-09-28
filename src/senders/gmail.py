@@ -2,6 +2,7 @@ import json, os, secrets, uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 import requests
+from psycopg.types.json import Jsonb
 
 from src.db import db
 from .service import encrypt_secret, decrypt_secret
@@ -20,13 +21,13 @@ def _config():
         raise RuntimeError("Google OAuth is not configured")
     return client_id,client_secret,f"{base}/oauth/gmail/callback"
 
-def start(user_id,sender_id):
+def start(user_id,display_name):
     client_id,_,redirect_uri=_config()
     state=secrets.token_urlsafe(32)
     expires=datetime.now(timezone.utc)+timedelta(minutes=10)
     with db() as conn:
         conn.execute("DELETE FROM sender_oauth_states WHERE expires_at < now()")
-        conn.execute("INSERT INTO sender_oauth_states(state,user_id,sender_id,provider,expires_at) VALUES(%s,%s,%s,'gmail_oauth',%s)",(state,user_id,sender_id,expires))
+        conn.execute("INSERT INTO sender_oauth_states(state,user_id,sender_id,provider,display_name,expires_at) VALUES(%s,%s,NULL,'gmail_oauth',%s,%s)",(state,user_id,display_name,expires))
         conn.commit()
     params={"client_id":client_id,"redirect_uri":redirect_uri,"response_type":"code","scope":GMAIL_SCOPE,"access_type":"offline","include_granted_scopes":"true","state":state,"prompt":"consent"}
     return f"{AUTH_URL}?{urlencode(params)}"
@@ -34,11 +35,11 @@ def start(user_id,sender_id):
 def callback(state,code):
     client_id,client_secret,redirect_uri=_config()
     with db() as conn:
-        row=conn.execute("SELECT user_id,sender_id FROM sender_oauth_states WHERE state=%s AND expires_at>now()",(state,)).fetchone()
+        row=conn.execute("SELECT user_id,sender_id,display_name FROM sender_oauth_states WHERE state=%s AND expires_at>now()",(state,)).fetchone()
         conn.execute("DELETE FROM sender_oauth_states WHERE state=%s",(state,))
         conn.commit()
     if not row: raise ValueError("Invalid or expired OAuth state")
-    user_id,sender_id=row
+    user_id,sender_id,display_name=row
     token=requests.post(TOKEN_URL,data={"client_id":client_id,"client_secret":client_secret,"code":code,"grant_type":"authorization_code","redirect_uri":redirect_uri},timeout=15)
     token.raise_for_status()
     tokens=token.json()
@@ -49,12 +50,17 @@ def callback(state,code):
     email=profile.json().get("emailAddress")
     if not email: raise RuntimeError("Google did not return the authorized Gmail address")
     with db() as conn:
-        existing=conn.execute("SELECT secret_encrypted FROM sender_accounts WHERE id=%s AND user_id=%s AND provider='gmail_oauth'",(sender_id,user_id)).fetchone()
-        if not existing: raise LookupError("Sender not found")
-        previous=json.loads(decrypt_secret(existing[0])) if existing[0] else {}
-        if not tokens.get("refresh_token") and previous.get("refresh_token"): tokens["refresh_token"]=previous["refresh_token"]
-        conn.execute("UPDATE sender_accounts SET email=%s,health='healthy',config=config || %s::jsonb,secret_encrypted=%s,updated_at=now() WHERE id=%s AND user_id=%s",
-                     (email,json.dumps({"oauth_email":email,"oauth_scopes":[GMAIL_SCOPE]}),encrypt_secret(json.dumps(tokens)),sender_id,user_id))
+        if sender_id:
+            existing=conn.execute("SELECT secret_encrypted FROM sender_accounts WHERE id=%s AND user_id=%s AND provider='gmail_oauth'",(sender_id,user_id)).fetchone()
+            if not existing: raise LookupError("Sender not found")
+            previous=json.loads(decrypt_secret(existing[0])) if existing[0] else {}
+            if not tokens.get("refresh_token") and previous.get("refresh_token"): tokens["refresh_token"]=previous["refresh_token"]
+            conn.execute("UPDATE sender_accounts SET email=%s,health='healthy',config=config || %s::jsonb,secret_encrypted=%s,updated_at=now() WHERE id=%s AND user_id=%s",
+                         (email,json.dumps({"oauth_email":email,"oauth_scopes":[GMAIL_SCOPE]}),encrypt_secret(json.dumps(tokens)),sender_id,user_id))
+        else:
+            sender_id=uuid.uuid4()
+            conn.execute("INSERT INTO sender_accounts(id,user_id,display_name,email,provider,enabled,health,config,secret_encrypted) VALUES(%s,%s,%s,%s,'gmail_oauth',true,'healthy',%s,%s)",
+                         (sender_id,user_id,display_name or 'Gmail',email,Jsonb({"oauth_email":email,"oauth_scopes":[GMAIL_SCOPE]}),encrypt_secret(json.dumps(tokens))))
         conn.commit()
     return email
 

@@ -4,6 +4,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dotenv import load_dotenv
 load_dotenv()
 import json, os, time, requests, streamlit as st
+from src.ui.auth.session import controller as auth_controller, restore as restore_web_session
+from src.ui.auth.login import render as render_login
 from src.ui.components.sidebar import render_sidebar
 from src.ui.components.header import render_header
 from src.ui.pages.lead_workstation import render_lead_workstation
@@ -19,6 +21,7 @@ from src.ui.components.footer import render_footer
 API=os.getenv('API_URL','http://127.0.0.1:8000').rstrip('/')
 PUBLIC_API_URL=os.getenv('PUBLIC_API_URL','https://api.scrapee.uk').rstrip('/')
 st.set_page_config(page_title='Scrappee',page_icon='🕷️',layout='wide')
+auth_cookies=auth_controller()
 for k,v in [('token',None),('user',None),('scrap_id',None),('nav_page','Dashboard'),('parameters',[]),('selected',[]),('job',None),('serp_token',None),('manual_sources',[]),('submission_completed',False),('admin_user_page',1),('admin_user_page_size',50),('admin_selected_users',set()),('pending_delete_scrap',None),('pending_delete_user',None),('pending_bulk_delete_users',None),('premium_notice',None)]: st.session_state.setdefault(k,v)
 
 def headers(): return {'Authorization':f'Bearer {st.session_state.token}'}
@@ -71,22 +74,6 @@ def job_telemetry(job):
     events=job.get('events') or []
     latest=events[-1] if events else {}
     return latest,job.get('counts') or {}
-def restore_web_session():
-    try:
-        token=st.context.cookies.get("scrappee_web_session")
-    except Exception:
-        token=None
-    if not token:return False
-    try:
-        r=requests.get(f'{API}/auth/me',headers={'Authorization':f'Bearer {token}'},timeout=10)
-        if not r.ok:return False
-        data=r.json();st.session_state.token=token;st.session_state.user={'email':data['email']};return True
-    except requests.RequestException:
-        return False
-
-def login(email,password,register=False):
-    r=requests.post(f'{API}/auth/{"register" if register else "login"}',json={'email':email,'password':password},timeout=20); r.raise_for_status(); data=r.json(); st.session_state.token=data['token']; st.session_state.user={'email':data['email']}
-
 def ensure_serp_session():
     if st.session_state.serp_token:return
     if not st.session_state.scrap_id: raise RuntimeError('Cannot create a SERP session without a Current Scrap')
@@ -130,29 +117,10 @@ def import_payload():
         st.error(f'Capture payload was invalid: {exc}')
     st.query_params.clear()
 
-if not st.session_state.token: restore_web_session()
+if not st.session_state.token: restore_web_session(API, auth_cookies)
 if not st.session_state.token:
-    st.markdown("<style>section[data-testid='stSidebar']{display:none!important;}[data-testid='collapsedControl']{display:none!important;}</style>", unsafe_allow_html=True)
-    st.title('Scrappee');st.caption('Lead research workspace')
-    tab1,tab2=st.tabs(['Sign in','Create account'])
-    with tab1:
-        with st.form('login'):
-            e=st.text_input('Email');p=st.text_input('Password',type='password');ok=st.form_submit_button('Sign in',type='primary')
-        if ok:
-            try:login(e,p);st.rerun()
-            except Exception as exc:st.error('Sign in failed. Check your email and password.')
-    with tab2:
-        with st.form('register'):
-            e=st.text_input('Email',key='reg_e');p=st.text_input('Password',type='password',key='reg_p');ok=st.form_submit_button('Create account',type='primary')
-        if ok:
-            try: login(e,p,True); st.rerun()
-            except requests.HTTPError as exc:
-                detail=(exc.response.json().get('detail') if exc.response is not None else None) or 'Account creation failed.'
-                st.error(f'Could not create account: {detail}')
-            except Exception as exc: st.error(f'Could not create account: {exc}')
+    render_login(API, auth_cookies)
     st.stop()
-
-import_payload()
 if st.session_state.token and not st.session_state.scrap_id:
     try:
         current=api_json('GET','/scraps/current')
@@ -173,14 +141,14 @@ if st.session_state.token and not st.session_state.scrap_id:
         st.warning(f'Current Scrap data is invalid: {exc}')
 if st.session_state.token and st.session_state.scrap_id and st.session_state.serp_token:
     st.markdown(f'<div data-scrappee-serp-bridge="{st.session_state.serp_token}" style="display:none" aria-hidden="true"></div>', unsafe_allow_html=True)
-page=render_sidebar(api_json=api_json)
+page=render_sidebar(api_json=api_json, auth_cookies=auth_cookies)
 billing=st.session_state.get('billing')
 
 if page=='Senders':
     render_senders(api, api_json, api_error)
 
 elif page=='Dashboard':
-    render_dashboard(api_json)
+    render_dashboard(api_json, api)
 
 elif page=='New Scrap':
     render_new_scrap(api, api_json, billing, ensure_serp_session)
