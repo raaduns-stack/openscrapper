@@ -497,7 +497,39 @@ class LeadDiscoveryPipeline:
             if role_match:
                 position = role_match.group(1).strip()
 
-        # LinkedIn snippets often contain a clean "Name · Role · Company" representation.
+        # LinkedIn SERP titles commonly encode: "Name - Role @ Company".
+        # Prefer this structured form because it gives us an authoritative company
+        # boundary instead of guessing company text from arbitrary snippets.
+        if is_linkedin_person:
+            linkedin_title = title
+            structured = _re.match(
+                r"^\s*(?P<name>[A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+){1,3})\s*[-–—|]\s*"
+                r"(?P<role>[^@|]+?)\s+(?:@|\bat\b)\s+(?P<company>[^|]+?)\s*$",
+                linkedin_title,
+                _re.I,
+            )
+            if structured:
+                parsed_name = structured.group("name").strip()
+                parsed_role = structured.group("role").strip(" .")
+                parsed_company = structured.group("company").strip(" .")
+                if parsed_name and not name_part:
+                    name_part = parsed_name
+                if parsed_role and not position:
+                    position = parsed_role
+                if parsed_company and not company_name:
+                    company_name = parsed_company
+
+            # Alternate LinkedIn form: "Name · Role · Company".
+            if not company_name:
+                parts = [p.strip() for p in _re.split(r"\s*[·•]\s*", linkedin_title) if p.strip()]
+                if len(parts) >= 3 and _re.match(r"^[A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+){1,3}$", parts[0]):
+                    if not name_part:
+                        name_part = parts[0]
+                    if not position:
+                        position = parts[1]
+                    company_name = parts[2].strip(" .")
+
+        # LinkedIn snippets often contain a clean role representation.
         if not position and is_linkedin_person:
             role_match = _re.search(r"\b(?:Registered|Licensed|Family|Staff|Senior|Critical Care|Clinical|Nurse|Operating Room|Intensive Care|Assistant|Customer|Practice|Medical|Healthcare)[^\n·|]{0,120}", raw_text, _re.I)
             if role_match:
