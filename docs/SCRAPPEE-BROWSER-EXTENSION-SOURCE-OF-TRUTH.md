@@ -1,8 +1,8 @@
 # Scrappee Browser Extension — Source of Truth
 
 **Status:** APPROVED / CANONICAL
-**Version:** 0.6.7
-**Date:** 2026-09-17
+**Version:** 0.6.12
+**Date:** 2026-09-28
 
 ## Purpose
 
@@ -40,6 +40,14 @@ The extension workflow is intentionally simple and must not be redesigned withou
 - The extension must never require the user to re-enter credentials merely because a SERP page changed.
 - Extension-to-web authentication uses a separate persistent web session so reloading the Scrappee UI does not discard the web login state.
 - Extension logout clears the extension authentication state; it does not directly clear the separate web-session cookie.
+
+## Connection status — LOCKED
+
+- An authenticated extension sends a heartbeat to Scrappee approximately once per minute.
+- The API records the authenticated user's extension version and last-seen time.
+- The Dashboard considers the extension connected when the last heartbeat is within 120 seconds.
+- The Dashboard detects an outdated extension version and provides the current extension package directly.
+- No browser-side connection state is inferred by the Dashboard; connection status is based on authenticated server-side heartbeat data.
 
 ## SERP capture — LOCKED
 
@@ -108,3 +116,48 @@ Approved changes must update this document and the extension version together.
 - Extension service worker: `browser-extension/service-worker.js`
 - Authentication backend: `src/auth.py`, `src/api/app.py`, `src/db.py`
 - API handoff contract: `docs/SCRAPPEE-V1.3-API-HANDOFF.md`
+
+## Page Lead Indexer — APPROVED
+
+The extension includes a **Page Lead Indexer** alongside the locked SERP workflow.
+
+### Controls
+
+- **Auto Indexing:** OFF by default. The user can turn it OFF and the preference persists in extension storage.
+- **INDEX THIS PAGE:** explicitly indexes the currently active HTTP(S) page.
+- Current Scrap is the persistence target; without an active Current Scrap, indexing is not submitted.
+
+### Auto behavior
+
+When Auto Indexing is ON, completed navigation is inspected locally for a lead-bearing signal. Pages without relevant contact/lead signals are discarded locally and are never sent to Scrappee. Search engines, Scrappee domains, browser-internal pages, and extension pages are excluded.
+
+For eligible pages the extension submits the rendered page HTML and URL to the authenticated `/page-indexer/process` API. The extension does not solve CAPTCHA, automate authentication, or operate a server-side browser.
+
+### Billing UX
+
+The backend controls the price. The default commercial price is **$0.01 per eligible indexed page**. The extension displays processing/usage state but does not become the billing authority.
+
+### Safety
+
+- Page content is size-bounded before submission.
+- Identical user/page content fingerprints are idempotent and are not charged repeatedly.
+- Backend validation remains authoritative even when the extension eligibility gate passes.
+- Failed backend/provider processing is refunded by the backend.
+
+
+## Page Lead Indexer — Approved UI Contract
+
+**Email-only integration:** When Email only is ON, Page Lead Indexer MUST submit only extracted leads containing a valid personal email. Leads without email or with generic mailbox prefixes are discarded before qualification/persistence. When Email only is OFF, the normal accepted-lead paths remain available.
+
+The Page Lead Indexer UI is a separate presentation layer from the SERP capture counter. It MUST clearly distinguish **SERP Captured** from **Page Leads**.
+
+Approved interaction and display:
+- **Auto Indexing:** OFF by default and persistent when changed.
+- **INDEX THIS PAGE:** explicit page-index action.
+- After successful indexing, show a success card with the indexed URL, lead count, and charge.
+- Show separate counters for SERP results and Page Leads.
+- Show the configured per-page charge for the most recent indexed page.
+- **VIEW LAST INDEXED LEADS** retrieves the existing server-side indexed result and MUST NOT trigger a new charge.
+- Lead preview cards show available name, position/company, email/phone, geography, and source URL.
+- Existing SERP controls remain unchanged.
+- No UI action may bypass backend billing, validation, qualification, deduplication, or persistence rules.

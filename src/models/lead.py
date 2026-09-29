@@ -59,7 +59,8 @@ def is_accepted_lead(data: object, generic_prefixes: set[str] | None = None) -> 
     values = data if isinstance(data, dict) else data.__dict__
     email = str(values.get("email") or "").strip()
     if email and is_personal_email(email, generic_prefixes):
-        return True
+        values = data if isinstance(data, dict) else data.__dict__
+        return any(_is_plausible_person_name(values.get(field)) for field in PERSON_IDENTITY_FIELDS)
     return has_person_specific_evidence(data)
 
 

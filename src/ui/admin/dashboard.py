@@ -7,14 +7,16 @@ from src.ui.admin.serp_providers import render_serp_providers
 from src.ui.admin.client_policies import render_client_policies
 from src.ui.admin.browser_extension import render_browser_extension
 from src.ui.admin.search_templates import render_search_templates
+from src.ui.admin.deposits import render_deposits
+from src.ui.admin.support import render_support_admin
 
 def render_admin(api, api_json, api_error):
     admins={x.strip().lower() for x in os.getenv("ADMIN_EMAILS","").split(",") if x.strip()}
     user=st.session_state.get("user") or {}
     if user.get("email","").lower() not in admins:
         return
-    tabs=st.tabs(["Billing & Limits","Wallets","Users","SERP Providers","Client Policies","Search Templates","Browser Extension"])
-    renderers=[render_billing,render_wallets,render_users,render_serp_providers,render_client_policies,render_search_templates,render_browser_extension]
+    tabs=st.tabs(["Support","Billing & Limits","Wallets","Deposits","Users","SERP Providers","Client Policies","Search Templates","Browser Extension"])
+    renderers=[render_support_admin,render_billing,render_wallets,render_deposits,render_users,render_serp_providers,render_client_policies,render_search_templates,render_browser_extension]
     for tab,renderer in zip(tabs,renderers):
         with tab:
             renderer(api,api_json,api_error)

@@ -336,3 +336,29 @@ def test_admin_user_pagination_and_bulk_delete_limit():
     assert r.status_code==409
     r=client.post('/admin/users/bulk-delete',headers=headers,json={'user_ids':target_ids[200:]})
     assert r.status_code==200 and r.json()['deleted']==5
+
+
+async def _fake_page_extract(self, html, source_url, evidence=None):
+    from src.models.lead import Lead
+    return [Lead(first_name="Jane",last_name="Doe",email="jane@example.com",source_url=source_url)]
+
+def test_page_indexer_charges_once_and_dedupes(monkeypatch):
+    client,headers,user_id=auth_client(); fund(user_id,1000)
+    scrap=create_scrap(client,headers,'Page Indexer')
+    monkeypatch.setattr(api.AdaptiveLeadExtractor,'extract',_fake_page_extract)
+    payload={'url':'https://example.com/contact','title':'Contact Jane','html':'<html><body><div class="contact"><span>Jane Doe</span><a href="mailto:jane@example.com">jane@example.com</a></div></body></html>','auto':False}
+    first=client.post('/page-indexer/process',headers=headers,json=payload)
+    assert first.status_code==200
+    assert first.json()['charged_cents']==1 and first.json()['leads']==1
+    second=client.post('/page-indexer/process',headers=headers,json=payload)
+    assert second.status_code==200 and second.json()['duplicate'] is True and second.json()['charged_cents']==0
+    assert client.get('/billing',headers=headers).json()['balance_cents']==799
+    with db() as conn:
+        assert conn.execute("SELECT count(*) FROM leads WHERE scrap_id=%s",(uuid.UUID(scrap['id']),)).fetchone()[0]==1
+        assert conn.execute("SELECT count(*) FROM wallet_transactions WHERE user_id=%s AND transaction_type='page_indexer'",(uuid.UUID(user_id),)).fetchone()[0]==1
+
+def test_page_indexer_discards_ineligible_without_charge():
+    client,headers,user_id=auth_client(); fund(user_id,1000); create_scrap(client,headers,'Page Indexer Gate')
+    response=client.post('/page-indexer/process',headers=headers,json={'url':'https://example.com/about','title':'About','html':'<html><body><p>Company overview only.</p></body></html>'})
+    assert response.status_code==200 and response.json()['eligible'] is False
+    assert client.get('/billing',headers=headers).json()['balance_cents']==800

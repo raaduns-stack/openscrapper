@@ -1,13 +1,29 @@
 # Scrappee UI Architecture — Source of Truth
 
-**Status:** Approved design — implementation not yet started  
-**Scope:** Customer UI, shared shell, Senders UI, Admin UI
+**Status:** Approved architecture — React migration approved by CTO; implementation pending
+**Scope:** Customer UI, shared shell, Senders UI, Admin UI, frontend technology migration
 
 ## 1. Purpose
 
 This document defines the approved UI architecture for the next UI refactor. It is a structural/UI change only. Existing extraction, scraping, enrichment, qualification, deduplication, export, and browser-extension behavior must remain unchanged unless separately approved.
 
-## 2. UI shell
+## 2. Frontend technology decision
+
+**Decision: React frontend.** The CTO approved replacing Streamlit as the customer/admin frontend technology.
+
+Rationale: the product now requires conventional SaaS application behavior—persistent application chrome, controlled routing, responsive layouts, complex navigation, account/billing surfaces, support, admin workflows, and browser-extension integration. The existing Streamlit implementation creates avoidable layout and DOM constraints for these requirements.
+
+Migration boundary:
+
+- Keep the existing API, scraping, extraction, enrichment, qualification, deduplication, persistence, billing, and browser-extension backend behavior unless separately approved.
+- Replace the Streamlit presentation/routing layer with a React frontend.
+- Reuse the existing API contracts where practical; API changes require separate approval.
+- Do not begin a broad backend rewrite as part of the frontend migration.
+- Streamlit remains temporarily available only until the React frontend reaches functional parity and is approved for cutover.
+
+The React migration is an approved architecture decision, not authorization to publish or release. Implementation remains local until separately approved.
+
+## 3. UI shell
 
 The application shell has exactly one implementation for each global surface:
 
@@ -32,7 +48,7 @@ Single source for application/version information and global footer content.
 
 No page may create its own independent sidebar, header, or footer implementation.
 
-## 3. Customer pages
+## 4. Customer pages
 
 ```text
 src/ui/pages/
@@ -60,7 +76,7 @@ Primary metrics should remain concise. Detailed technical telemetry belongs in s
 
 The Cancel Scrap action must remain available during an active Scrap and terminate the active Scrap without deleting its historical data.
 
-## 4. Shared UI components
+## 5. Shared UI components
 
 Reusable visual/interaction components belong under:
 
@@ -73,7 +89,7 @@ src/ui/components/
 
 Components should contain presentation/reusable interaction logic, not business-domain workflows.
 
-## 5. Senders UI
+## 6. Senders UI
 
 Senders is a dedicated product surface, not a single monolithic page.
 
@@ -88,7 +104,7 @@ src/ui/senders/
 
 Navigation and information hierarchy must keep sender configuration, campaign details, letters, and reply-to configuration distinct.
 
-## 6. Admin UI
+## 7. Admin UI
 
 Admin is a separate application surface and must not be mixed into normal customer navigation/content.
 
@@ -109,7 +125,7 @@ Hiding the Admin navigation item in the frontend is not an authorization mechani
 
 A non-admin user must not be able to access Admin functionality by manually constructing a URL or API request.
 
-## 7. Application entry point
+## 8. Application entry point
 
 `src/ui/app.py` remains the application entry/router. It should be responsible for:
 
@@ -132,7 +148,7 @@ src/ui/
 └── admin/
 ```
 
-## 8. Authorization model
+## 9. Authorization model
 
 ```text
 Authenticated user
@@ -147,7 +163,7 @@ Authenticated user
 
 Authorization is enforced server-side. UI visibility is an additional usability layer only.
 
-## 9. Refactor constraints
+## 10. Refactor constraints
 
 1. No intentional change to scraping/extraction/enrichment behavior.
 2. No intentional change to database semantics unless separately approved.
@@ -156,7 +172,7 @@ Authorization is enforced server-side. UI visibility is an additional usability 
 5. Do not perform a broad rewrite of the 900+ line UI in one operation.
 6. Existing unrelated working-tree changes must not be overwritten, reverted, or reformatted as part of this refactor.
 
-## 10. Implementation order
+## 11. Implementation order
 
 ```text
 1. Shared shell: sidebar / header / footer
@@ -169,13 +185,13 @@ Authorization is enforced server-side. UI visibility is an additional usability 
 8. Final UI module decomposition/cleanup
 ```
 
-## 11. Git release control
+## 12. Git release control
 
 This document does not authorize a release.
 
 All implementation commits remain local by default. No push or merge to stable/main is permitted without an explicit CTO command.
 
-## 12. Engineering Agent Operating Model
+## 13. Engineering Agent Operating Model
 
 1. **CTO** = final authority for architecture, approval, push, merge, and release.
 2. **Lead Engineer** = architecture, implementation planning, source-of-truth compliance, review, validation, and regression analysis.

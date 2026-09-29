@@ -1,9 +1,14 @@
 const KEY='harvestedResults';
 const PAGE_KEY='capturedSerpPages';
 const AUTO_KEY='serpAutoState';
+const EMAIL_ONLY_KEY='emailOnlySerp';
+const PAGE_INDEX_AUTO_KEY='pageIndexAuto';
+const PAGE_INDEX_LAST_KEY='pageIndexLast';
+let PAGE_INDEX_INFLIGHT=false;
 const AUTH_KEY='scrappeeAuth';
 const API='https://api.scrapee.uk';
 const ALARM='scrappee-serp-resume';
+const HEARTBEAT_ALARM='scrappee-extension-heartbeat';
 
 async function readResults(){const v=await chrome.storage.local.get(KEY);return Array.isArray(v[KEY])?v[KEY]:[];}
 async function badge(){const r=await readResults();await chrome.action.setBadgeText({text:r.length?String(Math.min(r.length,9999)):''});}
@@ -11,6 +16,15 @@ async function readAuth(){const v=await chrome.storage.local.get(AUTH_KEY);retur
 async function writeAuth(auth){await chrome.storage.local.set({[AUTH_KEY]:auth});return auth;}
 async function clearAuth(){await chrome.storage.local.remove(AUTH_KEY);}
 async function readAuto(){const v=await chrome.storage.local.get(AUTO_KEY);return v[AUTO_KEY]||null;}
+async function readEmailOnly(){const v=await chrome.storage.local.get(EMAIL_ONLY_KEY);return v[EMAIL_ONLY_KEY] !== false;}
+function hasEmailEvidence(item){const text=[item?.title,item?.snippet,item?.raw_text].filter(Boolean).join(' ');return /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(text);}
+
+async function readPageIndexAuto(){const v=await chrome.storage.local.get(PAGE_INDEX_AUTO_KEY);return v[PAGE_INDEX_AUTO_KEY] === true;}
+async function setPageIndexAuto(enabled){await chrome.storage.local.set({[PAGE_INDEX_AUTO_KEY]:!!enabled});}
+async function capturePageForIndex(tabId){const [{result}]=await chrome.scripting.executeScript({target:{tabId},func:()=>{const host=location.hostname.toLowerCase();if(!/^https?:$/.test(location.protocol))return{ok:true,eligible:false};if(host==='scrapee.uk'||host.endsWith('.scrapee.uk')||/google\.|bing\./i.test(host))return{ok:true,eligible:false};const text=(document.body?.innerText||'').slice(0,500000);const title=document.title||'';const eligible=/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(text)||/(?:mailto:|tel:|contact|team|staff|employee|leadership|management|director|manager|founder|ceo|owner|partner|sales|business development)/i.test(title+' '+text);if(!eligible)return{ok:true,eligible:false};const clone=document.documentElement.cloneNode(true);clone.querySelectorAll('script,style,noscript,svg,iframe').forEach(n=>n.remove());let html=clone.outerHTML;if(html.length>1200000)html=html.slice(0,1200000);return{ok:true,eligible:true,url:location.href,title,html};}});return result;}
+async function indexPageTab(tabId,auto=false){if(PAGE_INDEX_INFLIGHT)return null;let tab;try{tab=await chrome.tabs.get(tabId);}catch(_){return null;}if(!tab?.url||!/https?:\/\//i.test(tab.url))return null;const page=await capturePageForIndex(tabId);if(!page?.ok||!page.eligible)return{eligible:false};const fingerprint=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(page.url+'\n'+page.html));const fingerprintHex=[...new Uint8Array(fingerprint)].map(b=>b.toString(16).padStart(2,'0')).join('');const last=await chrome.storage.local.get(PAGE_INDEX_LAST_KEY);if(auto&&last[PAGE_INDEX_LAST_KEY]?.fingerprint===fingerprintHex)return{duplicate:true,eligible:true,leads:last[PAGE_INDEX_LAST_KEY].leads||0,charged_cents:0};PAGE_INDEX_INFLIGHT=true;try{const emailOnly=await readEmailOnly();const result=await api('/page-indexer/process',{method:'POST',body:JSON.stringify({url:page.url,title:page.title,html:page.html,auto,email_only:emailOnly})});await chrome.storage.local.set({[PAGE_INDEX_LAST_KEY]:{url:page.url,fingerprint:fingerprintHex,leads:result.leads||0,charged_cents:result.charged_cents||0,duplicate:!!result.duplicate,at:new Date().toISOString()}});return result;}finally{PAGE_INDEX_INFLIGHT=false;}}
+async function autoIndexTab(tabId){if(!(await readPageIndexAuto()))return;try{const result=await indexPageTab(tabId,true);if(result?.eligible&&result?.charged_cents>0)await chrome.action.setBadgeText({text:String(Math.min(result.leads||0,9999))});}catch(_){} }
+
 async function writeAuto(state){await chrome.storage.local.set({[AUTO_KEY]:state});return state;}
 async function clearAuto(){await chrome.storage.local.remove(AUTO_KEY);}
 
@@ -24,6 +38,8 @@ async function api(path,options={}){
  return data;
 }
 
+async function heartbeat(){const auth=await readAuth();if(!auth?.token)return;try{const r=await fetch(`${API}/extension/heartbeat`,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${auth.token}`,'X-Scrappee-Extension':'1'},body:JSON.stringify({version:chrome.runtime.getManifest().version})});if(r.status===401){await clearAuth();}}catch(_){} }
+
 async function validateAuth(){ const auth=await readAuth();
  if(!auth?.token)return {ok:false,reason:'missing'};
  try{
@@ -34,25 +50,31 @@ async function validateAuth(){ const auth=await readAuth();
  }catch(_){return {ok:true,auth};}
 }
 
-chrome.runtime.onInstalled.addListener(badge);
-chrome.runtime.onStartup.addListener(async()=>{await badge();const s=await readAuto();if(s?.running)chrome.alarms.create(ALARM,{delayInMinutes:0.05});});
+chrome.runtime.onInstalled.addListener(async()=>{const v=await chrome.storage.local.get(PAGE_INDEX_AUTO_KEY);if(v[PAGE_INDEX_AUTO_KEY]===undefined)await setPageIndexAuto(false);await badge();chrome.alarms.create(HEARTBEAT_ALARM,{periodInMinutes:1});await heartbeat();});
+chrome.runtime.onStartup.addListener(async()=>{await badge();chrome.alarms.create(HEARTBEAT_ALARM,{periodInMinutes:1});await heartbeat();const s=await readAuto();if(s?.running)chrome.alarms.create(ALARM,{delayInMinutes:0.05});});
+
+chrome.tabs.onUpdated.addListener((tabId,changeInfo)=>{if(changeInfo.status==='complete')setTimeout(()=>autoIndexTab(tabId),900);});
 
 chrome.alarms.onAlarm.addListener(async alarm=>{
+ if(alarm.name===HEARTBEAT_ALARM){await heartbeat();return;}
  if(alarm.name!==ALARM)return;
  try{await autoStep();}catch(e){await stopAuto(`Auto collection stopped: ${e.message||e}`);}
 });
 
 chrome.runtime.onMessage.addListener((message,sender,sendResponse)=>{
  if(message?.type==='auth_get'){(async()=>sendResponse({ok:true,auth:await readAuth()}))().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
- if(message?.type==='auth_set'){(async()=>sendResponse({ok:true,auth:await writeAuth(message.auth)}))().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
+ if(message?.type==='auth_set'){(async()=>{const auth=await writeAuth(message.auth);await heartbeat();chrome.alarms.create(HEARTBEAT_ALARM,{periodInMinutes:1});sendResponse({ok:true,auth});})().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
  if(message?.type==='auth_clear'){(async()=>{await clearAuth();await stopAuto('Logged out.');sendResponse({ok:true});})().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
  if(message?.type==='auth_validate'){(async()=>sendResponse(await validateAuth()))().catch(e=>sendResponse({ok:false,error:String(e)}));return true;} if(message?.type==='auto_start'){(async()=>sendResponse(await startAuto(message.tabId)))().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
  if(message?.type==='auto_stop'){(async()=>{await stopAuto('Auto collection stopped.');sendResponse({ok:true});})().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
  if(message?.type==='auto_clear'){(async()=>{await stopAuto('Local SERP preview cleared.');await chrome.storage.local.remove([KEY,PAGE_KEY,AUTO_KEY]);await chrome.action.setBadgeText({text:''});sendResponse({ok:true});})().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
  if(message?.type==='auto_resume'){(async()=>{const s=await readAuto();if(!s?.running)return sendResponse({ok:false,error:'Auto collection is not running.'});s.waitingChallenge=false;await writeAuto(s);chrome.alarms.create(ALARM,{delayInMinutes:0.01});sendResponse({ok:true});})().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
+ if(message?.type==='page_index_set_auto'){(async()=>{await setPageIndexAuto(message.enabled);sendResponse({ok:true,enabled:await readPageIndexAuto()});})().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
+ if(message?.type==='page_index_get_auto'){(async()=>sendResponse({ok:true,enabled:await readPageIndexAuto()}))().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
+ if(message?.type==='page_index_current'){(async()=>{try{sendResponse({ok:true,result:await indexPageTab(message.tabId,false)});}catch(e){sendResponse({ok:false,error:String(e)});}})();return true;}
  if(message?.type==='auto_state'){(async()=>sendResponse({ok:true,state:await readAuto()}))().catch(e=>sendResponse({ok:false,error:String(e)}));return true;}
  if(message?.type==='serp_results'){
-  (async()=>{const current=await readResults(),incoming=Array.isArray(message.results)?message.results:[],tagged=incoming.map((x,i)=>({...x,capture_id:`${Date.now()}-${sender.tab?.id||0}-${i}`,captured_at:new Date().toISOString()})),next=current.concat(tagged).slice(-10000);await chrome.storage.local.set({[KEY]:next});await badge();sendResponse({ok:true,count:next.length,added:tagged.length});})().catch(e=>sendResponse({ok:false,error:String(e)}));
+  (async()=>{const current=await readResults(),incoming=Array.isArray(message.results)?message.results:[],emailOnly=await readEmailOnly(),eligible=emailOnly?incoming.filter(hasEmailEvidence):incoming,tagged=eligible.map((x,i)=>({...x,capture_id:`${Date.now()}-${sender.tab?.id||0}-${i}`,captured_at:new Date().toISOString()})),next=current.concat(tagged).slice(-10000);await chrome.storage.local.set({[KEY]:next});await badge();sendResponse({ok:true,count:next.length,added:tagged.length});})().catch(e=>sendResponse({ok:false,error:String(e)}));
   return true;
  }
 });
@@ -63,7 +85,8 @@ async function startAuto(tabId){
  const scrap=await api('/scraps/current');
  if(!scrap)throw new Error('No active Current Scrap.');
  const session=await api('/serp/sessions',{method:'POST',body:JSON.stringify({scrap_id:scrap.id,ttl_seconds:86400})}); await api('/serp/sources',{method:'POST',body:JSON.stringify({token:session.token,url:tab.url})});
- const state={running:true,tabId,scrapId:scrap.id,scrapName:scrap.name,token:session.token,pages:0,results:0,waitingChallenge:false,lastPageKey:'',startedAt:new Date().toISOString(),message:'Starting…'};
+ const emailOnly=await readEmailOnly();
+ const state={running:true,tabId,scrapId:scrap.id,scrapName:scrap.name,token:session.token,pages:0,results:0,waitingChallenge:false,lastPageKey:'',startedAt:new Date().toISOString(),message:emailOnly?'Starting… Email-only ON.':'Starting… Email-only OFF.'};
  await writeAuto(state);await chrome.storage.local.remove([KEY,PAGE_KEY]);await badge();chrome.alarms.create(ALARM,{delayInMinutes:0.01});
  return {ok:true,state};
 }
@@ -86,13 +109,15 @@ async function autoStep(){
  const [{result}]=await chrome.scripting.executeScript({target:{tabId:state.tabId},func:captureSerpPage});
  if(!result?.ok){if(result?.challenge){state.waitingChallenge=true;state.message='CAPTCHA/challenge detected — solve it in the browser, then click RESUME.';await writeAuto(state);return;}throw new Error(result?.error||'SERP capture failed.');} if(!result.results?.length)return stopAuto('No organic SERP results detected; collection finished.');
  if(result.pageKey===state.lastPageKey)return stopAuto('SERP page did not change; collection stopped to prevent a loop.');
- const tagged=result.results.map((r,i)=>({...r,capture_id:`${Date.now()}-${state.pages}-${i}`,captured_at:new Date().toISOString()}));
+ const emailOnly=await readEmailOnly();
+ const eligibleResults=emailOnly?result.results.filter(hasEmailEvidence):result.results;
+ const tagged=eligibleResults.map((r,i)=>({...r,capture_id:`${Date.now()}-${state.pages}-${i}`,captured_at:new Date().toISOString()}));
  let synced=0; const uniqueAdded=[];
  for(let i=0;i<tagged.length;i+=25){const chunk=tagged.slice(i,i+25);const imported=await api('/serp/import',{method:'POST',body:JSON.stringify({token:state.token,urls:[],results:chunk,page_url:tab.url})});const fresh=Number(imported?.new_results||0);synced+=fresh;}
  const local=await readResults(); const seen=new Set(local.map(x=>x.url).filter(Boolean));
  for(const item of tagged){if(!item.url||seen.has(item.url))continue;seen.add(item.url);uniqueAdded.push(item);}
  const unique=local.concat(uniqueAdded).slice(-10000); await chrome.storage.local.set({[KEY]:unique});
- state.pages+=1;state.results=unique.length;state.lastPageKey=result.pageKey;state.message=`Page ${state.pages}: captured ${uniqueAdded.length} new unique results. Total ${state.results}.`;
+ state.pages+=1;state.results=unique.length;state.lastPageKey=result.pageKey;state.message=`Page ${state.pages}: ${emailOnly?'email-only ':''}captured ${uniqueAdded.length} new unique results. Total ${state.results}.`;
  await writeAuto(state);await chrome.action.setBadgeText({text:String(Math.min(state.results,9999))});
  if(result.challengeNext){state.waitingChallenge=true;state.message='CAPTCHA/challenge detected after capture — solve it in the browser, then click RESUME.';await writeAuto(state);return;}
  if(!result.nextHref)return stopAuto(`Collection finished: ${state.pages} SERP pages, ${state.results} results.`);

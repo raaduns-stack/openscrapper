@@ -29,6 +29,7 @@ def initialize_test_database():
         conn.execute("UPDATE app_settings SET value='200'::jsonb WHERE key='scrap_creation_price_cents'")
         conn.execute("UPDATE app_settings SET value='100'::jsonb WHERE key='premium_serp_price_cents'")
         conn.execute("UPDATE app_settings SET value='1000'::jsonb WHERE key='serp_result_limit'")
+        conn.execute("INSERT INTO app_settings(key,value) VALUES('page_indexer_price_cents','1'::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value")
         conn.commit()
     yield
 
@@ -40,7 +41,7 @@ def isolate_mutable_app_settings():
     with db() as conn:
         baseline = dict(conn.execute(
             "SELECT key,value FROM app_settings WHERE key IN "
-            "('scrap_creation_price_cents','premium_serp_price_cents','serp_result_limit')"
+            "('scrap_creation_price_cents','premium_serp_price_cents','serp_result_limit','page_indexer_price_cents')"
         ).fetchall())
     old_admin_emails = os.environ.get("ADMIN_EMAILS")
     yield

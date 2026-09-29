@@ -17,10 +17,12 @@ from src.ui.pages.current_scrap import render_current_scrap
 from src.ui.pages.new_scrap import render_new_scrap
 from src.ui.pages.exports import render_exports
 from src.ui.pages.settings import render_settings
+from src.ui.pages.deposit import render_deposit
+from src.ui.pages.support import render_support
 from src.ui.components.footer import render_footer
 API=os.getenv('API_URL','http://127.0.0.1:8000').rstrip('/')
 PUBLIC_API_URL=os.getenv('PUBLIC_API_URL','https://api.scrapee.uk').rstrip('/')
-st.set_page_config(page_title='Scrappee',page_icon='🕷️',layout='wide')
+st.set_page_config(page_title='Scrappee',page_icon='🕷️',layout='wide',initial_sidebar_state='collapsed')
 auth_cookies=auth_controller()
 for k,v in [('token',None),('user',None),('scrap_id',None),('nav_page','Dashboard'),('parameters',[]),('selected',[]),('job',None),('serp_token',None),('manual_sources',[]),('submission_completed',False),('admin_user_page',1),('admin_user_page_size',50),('admin_selected_users',set()),('pending_delete_scrap',None),('pending_delete_user',None),('pending_bulk_delete_users',None),('premium_notice',None)]: st.session_state.setdefault(k,v)
 
@@ -117,9 +119,41 @@ def import_payload():
         st.error(f'Capture payload was invalid: {exc}')
     st.query_params.clear()
 
-if not st.session_state.token: restore_web_session(API, auth_cookies)
+def _make_page(title, icon, render_fn, *, default=False):
+    def runner():
+        render_fn()
+        render_footer()
+    return st.Page(runner, title=title, icon=icon, default=default, url_path=title.lower().replace(' ', '-'))
+
+def _build_pages():
+    pages={
+        'Dashboard': _make_page('Dashboard', ':material/dashboard:', lambda: render_dashboard(api_json, api), default=True),
+        'New Scrap': _make_page('New Scrap', ':material/add_circle:', lambda: render_new_scrap(api, api_json, billing, ensure_serp_session)),
+        'Current Scrap': _make_page('Current Scrap', ':material/radio_button_checked:', lambda: render_current_scrap(api, api_json, refresh_current, billing, job_telemetry, auto_refresh_job)),
+        'Lead Workstation': _make_page('Lead Workstation', ':material/workspaces:', lambda: render_lead_workstation(api, api_json, billing, api_error)),
+        'Scrap History': _make_page('Scrap History', ':material/history:', lambda: render_scrap_history(api, api_json)),
+        'Exports': _make_page('Exports', ':material/download:', lambda: render_exports(api, api_json)),
+        'Senders': _make_page('Senders', ':material/mail:', lambda: render_senders(api, api_json, api_error)),
+        'Deposit': _make_page('Deposit', ':material/account_balance_wallet:', lambda: render_deposit(api, api_json, api_error)),
+        'Support Centre': _make_page('Support Centre', ':material/support_agent:', lambda: render_support(api, api_json, api_error)),
+        'Settings': _make_page('Settings', ':material/settings:', lambda: render_settings(api, api_json)),
+    }
+    admins={x.strip().lower() for x in os.getenv('ADMIN_EMAILS', '').split(',') if x.strip()}
+    user=st.session_state.get('user') or {}
+    email=user.get('email', '') if isinstance(user, dict) else str(user)
+    if email.lower() in admins:
+        pages['Admin']=_make_page('Admin', ':material/admin_panel_settings:', lambda: render_admin(api, api_json, api_error))
+    return pages
+
 if not st.session_state.token:
-    render_login(API, auth_cookies)
+    restore_web_session(API, auth_cookies)
+
+billing=None
+login_page=st.Page(lambda: render_login(API, auth_cookies), title='Login', icon=':material/login:', default=True)
+pages=_build_pages() if st.session_state.token else {}
+pg=st.navigation(list(pages.values()) if pages else [login_page], position='hidden')
+if not st.session_state.token:
+    pg.run()
     st.stop()
 if st.session_state.token and not st.session_state.scrap_id:
     try:
@@ -140,32 +174,9 @@ if st.session_state.token and not st.session_state.scrap_id:
     except (KeyError, ValueError, TypeError) as exc:
         st.warning(f'Current Scrap data is invalid: {exc}')
 if st.session_state.token and st.session_state.scrap_id and st.session_state.serp_token:
-    st.markdown(f'<div data-scrappee-serp-bridge="{st.session_state.serp_token}" style="display:none" aria-hidden="true"></div>', unsafe_allow_html=True)
-page=render_sidebar(api_json=api_json, auth_cookies=auth_cookies)
+    st.html(f'<div data-scrappee-serp-bridge="{st.session_state.serp_token}" style="display:none" aria-hidden="true"></div>')
+
+st.session_state['navigation_pages']=pages
+render_sidebar(pages, api_json=api_json, auth_cookies=auth_cookies)
 billing=st.session_state.get('billing')
-
-if page=='Senders':
-    render_senders(api, api_json, api_error)
-
-elif page=='Dashboard':
-    render_dashboard(api_json, api)
-
-elif page=='New Scrap':
-    render_new_scrap(api, api_json, billing, ensure_serp_session)
-
-elif page=='Lead Workstation':
-    render_lead_workstation(api, api_json, billing, api_error)
-
-elif page=='Current Scrap':
-    render_current_scrap(api, api_json, refresh_current, billing, job_telemetry, auto_refresh_job)
-
-elif page=='Scrap History':
-    render_scrap_history(api, api_json)
-
-elif page=='Exports':
-    render_exports(api, api_json)
-elif page=='Settings':
-    render_settings(api, api_json)
-elif page=='Admin':
-    render_admin(api, api_json, api_error)
-render_footer()
+pg.run()

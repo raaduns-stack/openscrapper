@@ -176,6 +176,22 @@ def persist_lead(scrap_id, lead: Lead, evidence_id=None) -> bool:
     return created
 
 
+def exclude_existing(scrap_id, leads: list[Lead]) -> list[Lead]:
+    """Return only leads whose identity is not already present in this Scrap."""
+    if not scrap_id or not leads:
+        return list(leads)
+    sid = uuid.UUID(str(scrap_id))
+    with db() as conn:
+        rows = conn.execute("SELECT data FROM leads WHERE scrap_id=%s", (sid,)).fetchall()
+    existing_keys = set()
+    for row in rows:
+        try:
+            existing_keys.update(identity_keys(Lead.model_validate(row[0] or {})))
+        except Exception:
+            continue
+    return [lead for lead in leads if not (identity_keys(lead) & existing_keys)]
+
+
 def dedupe(leads: list[Lead]) -> list[Lead]:
     seen: dict[tuple[str, ...], int] = {}
     result: list[Lead] = []

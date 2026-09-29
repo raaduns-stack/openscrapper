@@ -105,6 +105,13 @@ class AdaptiveLeadExtractor:
                 return "+1" + digits
         return normalized
 
+    @staticmethod
+    def _is_plausible_page_name(value: str) -> bool:
+        value=re.sub(r"\s+", " ", value or "").strip()
+        if not value or "@" in value or len(value)>120 or len(value.split())<2:
+            return False
+        return True
+
     def _extract_candidates(
         self,
         html: str,
@@ -170,6 +177,19 @@ class AdaptiveLeadExtractor:
                     "state": address.get("addressRegion"),
                     "country": address.get("addressCountry", {}).get("name") if isinstance(address.get("addressCountry"), dict) else address.get("addressCountry"),
                 })
+
+        page_names=[]
+        for node in selector.css("h1"):
+            value=" ".join(node.css("::text").getall()).strip()
+            if self._is_plausible_page_name(value):
+                page_names.append(re.sub(r"\s+", " ", value))
+        unique_page_names=list(dict.fromkeys(page_names))
+        if len(unique_page_names)==1:
+            first_name,last_name=self._split_name(unique_page_names[0])
+            for raw_email in selector.css('a[href^="mailto:"]::attr(href), [itemprop="email"]::attr(content)').getall():
+                email=self._clean_mailto(raw_email)
+                if email:
+                    add_lead({"first_name":first_name,"last_name":last_name,"email":email})
 
         company_containers = selector.css(
             '[itemtype*="LocalBusiness"], '

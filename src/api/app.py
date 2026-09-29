@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
-import asyncio, secrets, time, uuid, os, math
+import asyncio, secrets, time, uuid, os, math, logging, re
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
@@ -13,7 +13,12 @@ from pydantic import BaseModel, Field, model_validator
 from src.models.criteria import CrawlerConfig, SearchCriteria
 from src.models.lead import Lead
 from src.pipeline import LeadDiscoveryPipeline
-from src.dedupe.leads import persist_lead
+from src.extract.adaptive import AdaptiveLeadExtractor
+from src.extract.evidence import EvidenceBuilder
+from src.extract.email import is_personal_email
+from src.agent.qualification import LeadQualifier
+from src.agent.geography import GeographyResolver
+from src.dedupe.leads import persist_lead, dedupe, exclude_existing
 from src.observability.job_events import JobEventSink, emit_event
 from src.search.strategy import SearchStrategyEngine
 from src.search.template_engine import SearchTemplateEngine, VARIABLES
@@ -26,6 +31,9 @@ from psycopg.types.json import Jsonb
 from psycopg.errors import UniqueViolation
 from src.senders import service as sender_service
 from src.senders import gmail as gmail_oauth
+from src import support_service
+
+MIN_DEPOSIT_CENTS = 5000
 
 @asynccontextmanager
 async def lifespan(_app):
@@ -41,6 +49,7 @@ JOBS={}
 CANCEL_FLAGS=set()
 SERP_SESSIONS={}
 SERP_SESSION_TTL=1800
+_PAGE_GEOGRAPHY = GeographyResolver()
 DOWNLOADS_DIR=Path(__file__).resolve().parents[2] / 'downloads'
 
 @app.get('/downloads/scrappee-browser-import-v0.5.0.zip', include_in_schema=False)
@@ -177,6 +186,226 @@ class SearchTemplateRequest(BaseModel):
     template: str = Field(min_length=1,max_length=2000)
     active: bool = True
 
+class SupportTicketRequest(BaseModel):
+    subject: str = Field(min_length=3, max_length=200)
+    category: Literal["payment","account","login","system","scraping","billing","other"]
+    description: str = Field(min_length=3, max_length=20000)
+    priority: Literal["low","normal","high","urgent"] = "normal"
+
+class SupportMessageRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=20000)
+
+class SupportStatusRequest(BaseModel):
+    status: Literal["new","open","waiting_user","waiting_internal","resolved","closed"]
+
+class SupportAssignmentRequest(BaseModel):
+    assigned_to: str | None = None
+
+class SupportRatingRequest(BaseModel):
+    score: int = Field(ge=1, le=5)
+    comment: str | None = Field(default=None, max_length=5000)
+
+def _support_admin(req: Request):
+    user = current_user(req)
+    admins = {x.strip().lower() for x in os.getenv("ADMIN_EMAILS", "").split(",") if x.strip()}
+    if user["email"].lower() not in admins:
+        raise HTTPException(403, "Admin access required")
+    return user
+
+@app.get("/support/tickets")
+def support_tickets(req: Request, status: str | None = None, category: str | None = None):
+    user = current_user(req)
+    return support_service.list_tickets(uuid.UUID(user["id"]), status=status, category=category)
+
+@app.post("/support/tickets")
+def support_create_ticket(request: SupportTicketRequest, req: Request):
+    user = current_user(req)
+    return support_service.create_ticket(uuid.UUID(user["id"]), request.subject, request.category, request.description, request.priority)
+
+@app.get("/support/tickets/{ticket_id}/attachments/{attachment_id}")
+def support_attachment_download(ticket_id: str, attachment_id: str, req: Request):
+    user = current_user(req)
+    try:
+        tid = uuid.UUID(ticket_id); aid = uuid.UUID(attachment_id)
+    except ValueError:
+        raise HTTPException(422, "Invalid ticket id")
+    item = support_service.get_attachment(uuid.UUID(user["id"]), tid, aid)
+    if not item:
+        raise HTTPException(404, "Attachment not found")
+    path = Path(item["storage_path"])
+    if not path.is_file():
+        raise HTTPException(404, "Attachment file not found")
+    return FileResponse(path, media_type=item["content_type"] or "application/octet-stream", filename=item["filename"])
+
+@app.get("/support/tickets/{ticket_id}")
+def support_get_ticket(ticket_id: str, req: Request):
+    user = current_user(req)
+    try: tid = uuid.UUID(ticket_id)
+    except ValueError: raise HTTPException(422, "Invalid ticket id")
+    item = support_service.get_ticket(uuid.UUID(user["id"]), tid)
+    if not item: raise HTTPException(404, "Ticket not found")
+    return item
+
+@app.post("/support/tickets/{ticket_id}/messages")
+def support_message(ticket_id: str, request: SupportMessageRequest, req: Request):
+    user = current_user(req)
+    try: tid = uuid.UUID(ticket_id)
+    except ValueError: raise HTTPException(422, "Invalid ticket id")
+    item = support_service.add_message(uuid.UUID(user["id"]), tid, request.body)
+    if not item: raise HTTPException(404, "Ticket not found")
+    return item
+
+@app.post("/support/tickets/{ticket_id}/resolve")
+def support_resolve(ticket_id: str, req: Request):
+    user = current_user(req)
+    try: tid = uuid.UUID(ticket_id)
+    except ValueError: raise HTTPException(422, "Invalid ticket id")
+    item = support_service.set_status(uuid.UUID(user["id"]), tid, "resolved")
+    if not item: raise HTTPException(404, "Ticket not found")
+    return item
+
+@app.post("/support/tickets/{ticket_id}/rating")
+def support_rate(ticket_id: str, request: SupportRatingRequest, req: Request):
+    user = current_user(req)
+    try: tid = uuid.UUID(ticket_id)
+    except ValueError: raise HTTPException(422, "Invalid ticket id")
+    try:
+        item = support_service.rate_ticket(uuid.UUID(user["id"]), tid, request.score, request.comment)
+    except ValueError as exc: raise HTTPException(409, str(exc)) from exc
+    if not item: raise HTTPException(404, "Ticket not found")
+    return item
+
+@app.post("/support/tickets/{ticket_id}/attachments")
+async def support_attachment(ticket_id: str, req: Request):
+    from fastapi import UploadFile, File
+    user = current_user(req)
+    try: tid = uuid.UUID(ticket_id)
+    except ValueError: raise HTTPException(422, "Invalid ticket id")
+    form = await req.form()
+    upload = form.get("file")
+    if not upload or not hasattr(upload, "read"):
+        raise HTTPException(422, "Attachment file is required")
+    data = await upload.read()
+    try:
+        item = support_service.save_attachment(uuid.UUID(user["id"]), tid, upload.filename or "attachment", upload.content_type or "application/octet-stream", data)
+    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+    if not item: raise HTTPException(404, "Ticket not found")
+    return item
+
+@app.get("/admin/support/tickets/{ticket_id}/attachments/{attachment_id}")
+def admin_support_attachment_download(ticket_id: str, attachment_id: str, req: Request):
+    user = _support_admin(req)
+    try:
+        tid = uuid.UUID(ticket_id); aid = uuid.UUID(attachment_id)
+    except ValueError:
+        raise HTTPException(422, "Invalid ticket id")
+    item = support_service.get_attachment(uuid.UUID(user["id"]), tid, aid, admin=True)
+    if not item:
+        raise HTTPException(404, "Attachment not found")
+    path = Path(item["storage_path"])
+    if not path.is_file():
+        raise HTTPException(404, "Attachment file not found")
+    return FileResponse(path, media_type=item["content_type"] or "application/octet-stream", filename=item["filename"])
+
+@app.get("/admin/support/tickets")
+def admin_support_tickets(req: Request):
+    _support_admin(req)
+    raw_limit = req.query_params.get("limit", "50")
+    raw_offset = req.query_params.get("offset", "0")
+    try:
+        limit = max(1, min(int(raw_limit), 200))
+        offset = max(0, int(raw_offset))
+    except ValueError:
+        raise HTTPException(422, "Invalid pagination")
+    rows = support_service.list_tickets(
+        admin=True,
+        status=req.query_params.get("status") or None,
+        category=req.query_params.get("category") or None,
+        search=req.query_params.get("q") or None,
+        limit=limit,
+        offset=offset,
+    )
+    with db() as conn:
+        for item in rows:
+            row = conn.execute("SELECT u.email, a.email FROM users u LEFT JOIN users a ON a.id= (SELECT assigned_to FROM support_tickets WHERE id=%s) WHERE u.id=%s", (uuid.UUID(item["id"]), uuid.UUID(item["user_id"]))).fetchone()
+            item["user_email"] = row[0] if row else None
+            item["assigned_to_email"] = row[1] if row else None
+    return rows
+
+@app.get("/admin/support/metrics")
+def admin_support_metrics(req: Request):
+    _support_admin(req)
+    with db() as conn:
+        rows = conn.execute("SELECT status,count(*) FROM support_tickets GROUP BY status").fetchall()
+        rating = conn.execute("SELECT count(*) FROM support_ticket_ratings").fetchone()[0]
+    out = {k: 0 for k in support_service.STATUSES}
+    out.update({r[0]: r[1] for r in rows}); out["ratings"] = rating
+    return out
+
+@app.get("/admin/support/tickets/{ticket_id}")
+def admin_support_ticket(ticket_id: str, req: Request):
+    _support_admin(req)
+    try: tid = uuid.UUID(ticket_id)
+    except ValueError: raise HTTPException(422, "Invalid ticket id")
+    item = support_service.get_ticket(uuid.uuid4(), tid, admin=True)
+    if not item: raise HTTPException(404, "Ticket not found")
+    return item
+
+@app.post("/admin/support/tickets/{ticket_id}/messages")
+def admin_support_message(ticket_id: str, request: SupportMessageRequest, req: Request):
+    user = _support_admin(req)
+    try: tid = uuid.UUID(ticket_id)
+    except ValueError: raise HTTPException(422, "Invalid ticket id")
+    item = support_service.add_message(uuid.UUID(user["id"]), tid, request.body, admin=True)
+    if not item: raise HTTPException(404, "Ticket not found")
+    return item
+
+@app.post("/admin/support/tickets/{ticket_id}/internal-note")
+def admin_support_note(ticket_id: str, request: SupportMessageRequest, req: Request):
+    user = _support_admin(req)
+    try: tid = uuid.UUID(ticket_id)
+    except ValueError: raise HTTPException(422, "Invalid ticket id")
+    item = support_service.add_message(uuid.UUID(user["id"]), tid, request.body, admin=True, internal=True)
+    if not item: raise HTTPException(404, "Ticket not found")
+    return item
+
+@app.post("/admin/support/tickets/{ticket_id}/status")
+def admin_support_status(ticket_id: str, request: SupportStatusRequest, req: Request):
+    user = _support_admin(req)
+    try: tid = uuid.UUID(ticket_id)
+    except ValueError: raise HTTPException(422, "Invalid ticket id")
+    item = support_service.set_status(uuid.UUID(user["id"]), tid, request.status, admin=True)
+    if not item: raise HTTPException(404, "Ticket not found")
+    return item
+
+@app.get("/admin/support/assignees")
+def admin_support_assignees(req: Request):
+    _support_admin(req)
+    emails = [x.strip().lower() for x in os.getenv("ADMIN_EMAILS", "").split(",") if x.strip()]
+    if not emails:
+        return []
+    with db() as conn:
+        rows = conn.execute("SELECT id,email FROM users WHERE lower(email)=ANY(%s) ORDER BY lower(email)", (emails,)).fetchall()
+    return [{"id": str(row[0]), "email": row[1]} for row in rows]
+
+@app.post("/admin/support/tickets/{ticket_id}/assignment")
+def admin_support_assignment(ticket_id: str, request: SupportAssignmentRequest, req: Request):
+    user = _support_admin(req)
+    try: tid = uuid.UUID(ticket_id)
+    except ValueError: raise HTTPException(422, "Invalid ticket id")
+    assigned = None
+    if request.assigned_to:
+        try: assigned = uuid.UUID(request.assigned_to)
+        except ValueError: raise HTTPException(422, "Invalid assignee id")
+        with db() as conn:
+            row = conn.execute("SELECT lower(email) FROM users WHERE id=%s", (assigned,)).fetchone()
+        admins = {x.strip().lower() for x in os.getenv("ADMIN_EMAILS", "").split(",") if x.strip()}
+        if not row or row[0] not in admins:
+            raise HTTPException(403, "Assignee must be an authorized support administrator")
+    item = support_service.set_assignment(uuid.UUID(user["id"]), tid, str(assigned) if assigned else None)
+    if not item: raise HTTPException(404, "Ticket not found")
+    return item
+
 @app.post("/auth/register")
 def register(request: AuthRequest):
     try: user_id=create_user(request.email,request.password)
@@ -207,6 +436,51 @@ def logout(request: Request):
 @app.get("/auth/me")
 def me(request: Request):
     user=current_user(request); return {"id":user["id"],"email":user["email"]}
+
+
+LATEST_EXTENSION_VERSION = "0.6.12"
+
+class ExtensionHeartbeatRequest(BaseModel):
+    version: str = Field(min_length=1, max_length=32)
+
+@app.post("/extension/heartbeat")
+def extension_heartbeat(request: ExtensionHeartbeatRequest, req: Request):
+    user = current_user(req)
+    if req.headers.get("X-Scrappee-Extension") != "1":
+        raise HTTPException(403, "Extension client required")
+    with db() as conn:
+        conn.execute("""INSERT INTO extension_connections(user_id,version,last_seen_at,updated_at)
+            VALUES(%s,%s,now(),now())
+            ON CONFLICT(user_id) DO UPDATE SET version=EXCLUDED.version,last_seen_at=now(),updated_at=now()""",
+            (uuid.UUID(user["id"]), request.version))
+        conn.commit()
+    return {"ok": True, "version": request.version, "latest_version": LATEST_EXTENSION_VERSION}
+
+@app.get("/extension/status")
+def extension_status(req: Request):
+    user = current_user(req)
+    with db() as conn:
+        row = conn.execute("SELECT version,last_seen_at FROM extension_connections WHERE user_id=%s", (uuid.UUID(user["id"]),)).fetchone()
+    if not row:
+        return {"connected": False, "version": None, "latest_version": LATEST_EXTENSION_VERSION, "last_seen_at": None, "outdated": False}
+    version, last_seen = row
+    connected = (time.time() - last_seen.timestamp()) <= 120
+    return {"connected": connected, "version": version, "latest_version": LATEST_EXTENSION_VERSION, "last_seen_at": last_seen.isoformat(), "outdated": connected and version != LATEST_EXTENSION_VERSION}
+
+@app.get('/downloads/scrappee-browser-import-v0.6.12.zip', include_in_schema=False)
+def download_extension_v0612():
+    path=DOWNLOADS_DIR / 'Scrappee-Browser-Import-v0.6.12.zip'
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail='Extension package not found')
+    return FileResponse(path, media_type='application/zip', filename=path.name)
+
+
+@app.get('/downloads/scrappee-browser-import-v0.6.11.zip', include_in_schema=False)
+def download_extension_v0611():
+    path=DOWNLOADS_DIR / 'Scrappee-Browser-Import-v0.6.11.zip'
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail='Extension package not found')
+    return FileResponse(path, media_type='application/zip', filename=path.name)
 
 
 @app.get("/senders")
@@ -626,13 +900,15 @@ def billing(req: Request):
         price=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='scrap_creation_price_cents'").fetchone()[0]
         premium_price=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='premium_serp_price_cents'").fetchone()[0]
         paid_unit=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='paid_enrichment_unit_micros_usd'").fetchone()[0]
+        page_indexer_price=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='page_indexer_price_cents'").fetchone()[0]
         default_max_leads=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_default_max_leads'").fetchone()[0]
         max_leads=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_max_leads'").fetchone()[0]
         timeout_hours=conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_timeout_hours'").fetchone()[0]
-    return {"balance_cents":int(balance),"scrap_creation_price_cents":int(price),"premium_serp_price_cents":int(premium_price),"paid_enrichment_unit_micros_usd":int(paid_unit),"research_default_max_leads":int(default_max_leads),"research_max_leads":int(max_leads),"research_timeout_hours":int(timeout_hours)}
+    return {"balance_cents":int(balance),"scrap_creation_price_cents":int(price),"premium_serp_price_cents":int(premium_price),"paid_enrichment_unit_micros_usd":int(paid_unit),"page_indexer_price_cents":int(page_indexer_price),"research_default_max_leads":int(default_max_leads),"research_max_leads":int(max_leads),"research_timeout_hours":int(timeout_hours)}
 
 class BtcPayDepositRequest(BaseModel):
-    amount_cents: int = Field(gt=0, le=100000000)
+    amount_cents: int = Field(ge=MIN_DEPOSIT_CENTS, le=100000000)
+    asset: Literal['BTC', 'LTC', 'USDT'] = 'BTC'
 
 
 @app.post("/billing/deposits/btcpay")
@@ -644,15 +920,19 @@ def create_btcpay_deposit(request: BtcPayDepositRequest, req: Request):
     deposit_id = uuid.uuid4()
     order_id = str(deposit_id)
     try:
-        invoice = btcpay_create_invoice(f"{request.amount_cents / 100:.2f}", order_id)
+        with db() as conn:
+            store_key = {'LTC': 'btcpay_ltc_store_id', 'USDT': 'btcpay_usdt_store_id'}.get(request.asset)
+            store_id = _app_setting(conn, store_key) if store_key else None
+        invoice = btcpay_create_invoice(f"{request.amount_cents / 100:.2f}", order_id, store_id=store_id)
     except Exception as exc:
+        logging.exception("BTCPay invoice creation failed")
         raise HTTPException(502, "Could not create BTCPay invoice") from exc
     invoice_id = str(invoice.get("id") or "").strip()
     checkout_url = str(invoice.get("checkoutLink") or invoice.get("checkoutUrl") or "").strip()
     if not invoice_id or not checkout_url:
         raise HTTPException(502, "BTCPay returned an incomplete invoice")
     with db() as conn:
-        conn.execute("INSERT INTO wallet_deposits(id,user_id,btcpay_invoice_id,requested_cents,status) VALUES(%s,%s,%s,%s,'pending')", (deposit_id, uid, invoice_id, request.amount_cents))
+        conn.execute("INSERT INTO wallet_deposits(id,user_id,btcpay_invoice_id,requested_cents,asset,status) VALUES(%s,%s,%s,%s,%s,'pending')", (deposit_id, uid, invoice_id, request.amount_cents, request.asset))
         conn.commit()
     return {"deposit_id": str(deposit_id), "invoice_id": invoice_id, "requested_cents": request.amount_cents, "checkout_url": checkout_url, "invoice": invoice}
 
@@ -661,8 +941,8 @@ def create_btcpay_deposit(request: BtcPayDepositRequest, req: Request):
 def list_btcpay_deposits(req: Request):
     user = current_user(req)
     with db() as conn:
-        rows = conn.execute("SELECT id,btcpay_invoice_id,requested_cents,paid_btc,status,settled_at,created_at FROM wallet_deposits WHERE user_id=%s ORDER BY created_at DESC LIMIT 50", (uuid.UUID(user["id"]),)).fetchall()
-    return [{"id": str(r[0]), "invoice_id": r[1], "requested_cents": int(r[2]), "paid_btc": str(r[3]) if r[3] is not None else None, "status": r[4], "settled_at": r[5].isoformat() if r[5] else None, "created_at": r[6].isoformat()} for r in rows]
+        rows = conn.execute("SELECT id,btcpay_invoice_id,requested_cents,asset,paid_btc,status,settled_at,created_at FROM wallet_deposits WHERE user_id=%s ORDER BY created_at DESC LIMIT 50", (uuid.UUID(user["id"]),)).fetchall()
+    return [{"id": str(r[0]), "invoice_id": r[1], "requested_cents": int(r[2]), "asset": r[3], "paid_amount": str(r[4]) if r[4] is not None else None, "status": r[5], "settled_at": r[6].isoformat() if r[6] else None, "created_at": r[7].isoformat()} for r in rows]
 
 
 @app.post("/billing/deposits/btcpay/webhook")
@@ -703,6 +983,108 @@ async def btcpay_webhook(req: Request):
     return {"ok": True}
 
 
+class ManualDepositRequest(BaseModel):
+    method: Literal['usdt_manual', 'bank_transfer']
+    amount_cents: int = Field(ge=MIN_DEPOSIT_CENTS, le=100000000)
+    reference: str = Field(min_length=2, max_length=200)
+    sender_name: str | None = Field(default=None, max_length=200)
+    notes: str | None = Field(default=None, max_length=2000)
+
+class ManualDepositReviewRequest(BaseModel):
+    approved: bool
+
+class AdminDepositConfigRequest(BaseModel):
+    usdt_manual_enabled: bool = False
+    usdt_manual_wallet: str | None = Field(default=None, max_length=200)
+    bank_transfer_details: dict[str, str] = Field(default_factory=dict)
+    btcpay_ltc_store_id: str | None = Field(default=None, max_length=200)
+    btcpay_usdt_store_id: str | None = Field(default=None, max_length=200)
+
+
+def _app_setting(conn, key, default=None):
+    row = conn.execute("SELECT value FROM app_settings WHERE key=%s", (key,)).fetchone()
+    return row[0] if row else default
+
+@app.get("/billing/deposit-config")
+def deposit_config(req: Request):
+    current_user(req)
+    with db() as conn:
+        wallet = _app_setting(conn, 'usdt_manual_wallet')
+        enabled = _app_setting(conn, 'usdt_manual_enabled', False)
+        bank = _app_setting(conn, 'bank_transfer_details', {})
+        ltc_store = _app_setting(conn, 'btcpay_ltc_store_id')
+        usdt_store = _app_setting(conn, 'btcpay_usdt_store_id')
+    return {"usdt_manual_enabled": bool(enabled), "usdt_manual_wallet": wallet, "bank_transfer_details": bank or {}, "btcpay_ltc_configured": bool(ltc_store), "btcpay_usdt_configured": bool(usdt_store)}
+
+@app.post("/billing/deposits/manual")
+def create_manual_deposit(request: ManualDepositRequest, req: Request):
+    user = current_user(req)
+    uid = uuid.UUID(user['id'])
+    with db() as conn:
+        if request.method == 'usdt_manual':
+            enabled = _app_setting(conn, 'usdt_manual_enabled', False)
+            wallet = _app_setting(conn, 'usdt_manual_wallet')
+            if not enabled or not wallet:
+                raise HTTPException(503, 'Manual USDT deposits are not configured')
+        try:
+            row = conn.execute("INSERT INTO manual_deposits(id,user_id,method,amount_cents,reference,sender_name,notes) VALUES(gen_random_uuid(),%s,%s,%s,%s,%s,%s) RETURNING id,created_at", (uid,request.method,request.amount_cents,request.reference.strip(),request.sender_name,request.notes)).fetchone()
+            conn.commit()
+        except UniqueViolation as exc:
+            raise HTTPException(409, 'That payment reference has already been submitted') from exc
+    return {"id": str(row[0]), "status": "pending", "created_at": row[1].isoformat()}
+
+@app.get("/billing/deposits/manual")
+def list_manual_deposits(req: Request):
+    user = current_user(req)
+    with db() as conn:
+        rows = conn.execute("SELECT id,method,amount_cents,reference,sender_name,notes,status,reviewed_at,created_at FROM manual_deposits WHERE user_id=%s ORDER BY created_at DESC LIMIT 50", (uuid.UUID(user['id']),)).fetchall()
+    return [{"id":str(r[0]),"method":r[1],"amount_cents":int(r[2]),"reference":r[3],"sender_name":r[4],"notes":r[5],"status":r[6],"reviewed_at":r[7].isoformat() if r[7] else None,"created_at":r[8].isoformat()} for r in rows]
+
+@app.get("/admin/deposits")
+def admin_deposits(req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        rows=conn.execute("SELECT d.id,u.email,d.method,d.amount_cents,d.reference,d.sender_name,d.notes,d.status,d.created_at FROM manual_deposits d JOIN users u ON u.id=d.user_id WHERE d.status='pending' ORDER BY d.created_at ASC").fetchall()
+    return [{"id":str(r[0]),"email":r[1],"method":r[2],"amount_cents":int(r[3]),"reference":r[4],"sender_name":r[5],"notes":r[6],"status":r[7],"created_at":r[8].isoformat()} for r in rows]
+
+@app.post("/admin/deposits/{deposit_id}/review")
+def review_manual_deposit(deposit_id: str, request: ManualDepositReviewRequest, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        row=conn.execute("SELECT user_id,amount_cents,status FROM manual_deposits WHERE id=%s FOR UPDATE",(uuid.UUID(deposit_id),)).fetchone()
+        if not row: raise HTTPException(404,"Deposit not found")
+        uid,amount_cents,status=row
+        if status != 'pending': raise HTTPException(409,'Deposit has already been reviewed')
+        if request.approved:
+            balance=conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s FOR UPDATE",(uid,)).fetchone()
+            if not balance: raise HTTPException(500,'Wallet not initialized')
+            new_balance=int(balance[0])+int(amount_cents)
+            conn.execute("UPDATE wallets SET balance_cents=%s,updated_at=now() WHERE user_id=%s",(new_balance,uid))
+            conn.execute("INSERT INTO wallet_transactions(id,user_id,amount_cents,balance_after_cents,transaction_type,reference_id) VALUES(gen_random_uuid(),%s,%s,%s,'manual_deposit',%s) ON CONFLICT(user_id,transaction_type,reference_id) DO NOTHING",(uid,amount_cents,new_balance,deposit_id))
+        conn.execute("UPDATE manual_deposits SET status=%s,reviewed_by=%s,reviewed_at=now() WHERE id=%s",('approved' if request.approved else 'rejected',uuid.UUID(user['id']),uuid.UUID(deposit_id)))
+        conn.commit()
+    return {"id":deposit_id,"status":"approved" if request.approved else "rejected"}
+
+@app.post("/admin/deposit-config")
+def save_deposit_config(request: AdminDepositConfigRequest, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        values=(('usdt_manual_enabled',request.usdt_manual_enabled),('usdt_manual_wallet',request.usdt_manual_wallet),('bank_transfer_details',request.bank_transfer_details),('btcpay_ltc_store_id',request.btcpay_ltc_store_id),('btcpay_usdt_store_id',request.btcpay_usdt_store_id))
+        for key,value in values:
+            conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES(%s,%s,now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(key,Jsonb(value)))
+        conn.commit()
+    return {"saved":True}
+
+@app.get("/admin/deposit-config")
+def admin_deposit_config(req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        return {k:_app_setting(conn,k) for k in ('usdt_manual_enabled','usdt_manual_wallet','bank_transfer_details','btcpay_ltc_store_id','btcpay_usdt_store_id')}
+
 @app.post("/admin/scrap-price")
 def set_scrap_price(amount_cents: int, req: Request):
     user=current_user(req)
@@ -729,6 +1111,16 @@ def admin_premium_serp_price(request: AdminPriceRequest, req: Request):
     with db() as conn:
         conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('premium_serp_price_cents',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(amount_cents,)); conn.commit()
     return {"premium_serp_price_cents":amount_cents}
+
+@app.post("/admin/page-indexer-price")
+def admin_page_indexer_price(request: AdminPriceRequest, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    if request.amount_cents < 0: raise HTTPException(422,"Price cannot be negative")
+    with db() as conn:
+        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('page_indexer_price_cents',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(request.amount_cents,)); conn.commit()
+    return {"page_indexer_price_cents":request.amount_cents}
+
 
 @app.post("/admin/serp-limit")
 def admin_serp_limit(request: dict, req: Request):
@@ -1124,6 +1516,14 @@ class SerpSessionRequest(BaseModel):
     scrap_id: str|None=None
     ttl_seconds: int=Field(default=SERP_SESSION_TTL,ge=60,le=86400)
 
+class PageIndexerRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+    html: str = Field(min_length=1, max_length=1500000)
+    title: str = Field(default="", max_length=1000)
+    auto: bool = False
+    email_only: bool = True
+
+
 class SerpResult(BaseModel):
     url: str=Field(min_length=1,max_length=8192)
     title: str=""
@@ -1220,6 +1620,116 @@ def premium_serp(request: PremiumSerpRequest, req: Request):
             conn.execute("UPDATE premium_serp_extractions SET status='failed',result=%s,charged_cents=0,updated_at=now() WHERE id=%s",(Jsonb({"error":str(exc)}),extraction_id)); conn.commit()
         if isinstance(exc, HTTPException): raise
         raise HTTPException(502,f"Premium SERP provider failed: {exc}") from exc
+
+
+def _page_indexer_eligible(url: str, html: str, title: str) -> bool:
+    parsed=urlparse(url)
+    if parsed.scheme not in ("http","https") or not parsed.netloc:
+        return False
+    host=(parsed.hostname or "").casefold()
+    if host == "scrapee.uk" or host.endswith(".scrapee.uk") or "google." in host or "bing." in host:
+        return False
+    text=(title+" "+html[:500000]).casefold()
+    if re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}",text,re.I):
+        return True
+    if re.search(r"(?:mailto:|tel:|contact|team|staff|employee|leadership|management|director|manager|founder|ceo|owner|partner|sales|business development)",text,re.I):
+        return True
+    return False
+
+
+def _page_indexer_evidence(scrap_id, url: str, html: str):
+    evidence=EvidenceBuilder().build(url=url,html=html)
+    evidence_id=uuid.uuid4()
+    with db() as conn:
+        conn.execute("INSERT INTO evidence(id,scrap_id,source_type,source_id,data) VALUES(%s,%s,'page_indexer',NULL,%s)",(evidence_id,uuid.UUID(str(scrap_id)),Jsonb(evidence.model_dump(mode="json"))))
+        conn.commit()
+    return evidence,evidence_id
+
+
+@app.get("/page-indexer/usage")
+def page_indexer_usage(req: Request):
+    user=current_user(req); uid=uuid.UUID(user["id"])
+    with db() as conn:
+        row=conn.execute("SELECT COUNT(*),COALESCE(SUM(charged_cents),0),COALESCE(SUM(leads_count),0) FROM page_indexer_jobs WHERE user_id=%s AND status='completed'",(uid,)).fetchone()
+        recent=conn.execute("SELECT url,leads_count,charged_cents,created_at FROM page_indexer_jobs WHERE user_id=%s AND status='completed' ORDER BY created_at DESC LIMIT 10",(uid,)).fetchall()
+    return {"pages":int(row[0]),"charged_cents":int(row[1]),"leads":int(row[2]),"recent":[{"url":r[0],"leads":int(r[1]),"charged_cents":int(r[2]),"created_at":r[3].isoformat()} for r in recent]}
+
+
+@app.get("/page-indexer/leads")
+def page_indexer_leads(req: Request, job_id: str | None = None, url: str | None = None, email_only: bool = True):
+    user=current_user(req); uid=uuid.UUID(user["id"])
+    with db() as conn:
+        if job_id:
+            try: jid=uuid.UUID(job_id)
+            except ValueError as exc: raise HTTPException(422,"Invalid page-indexer job id") from exc
+            job=conn.execute("SELECT id,scrap_id,url,status,leads_count,charged_cents,result,created_at FROM page_indexer_jobs WHERE id=%s AND user_id=%s",(jid,uid)).fetchone()
+        elif url:
+            job=conn.execute("SELECT id,scrap_id,url,status,leads_count,charged_cents,result,created_at FROM page_indexer_jobs WHERE user_id=%s AND url=%s AND status='completed' ORDER BY created_at DESC LIMIT 1",(uid,url.strip())).fetchone()
+        else:
+            job=conn.execute("SELECT id,scrap_id,url,status,leads_count,charged_cents,result,created_at FROM page_indexer_jobs WHERE user_id=%s AND status='completed' ORDER BY created_at DESC LIMIT 1",(uid,)).fetchone()
+        if not job: raise HTTPException(404,"Page indexer job not found")
+        rows=conn.execute("SELECT data FROM leads WHERE scrap_id=%s AND data->>'source_url'=%s ORDER BY created_at DESC LIMIT 100",(job[1],job[2])).fetchall()
+    leads=[r[0] for r in rows]
+    if email_only:
+        leads=[lead for lead in leads if lead.get("email") and is_personal_email(str(lead.get("email")), None)]
+    return {"job_id":str(job[0]),"scrap_id":str(job[1]),"url":job[2],"status":job[3],"leads":len(leads),"charged_cents":int(job[5]),"result":job[6] or {},"created_at":job[7].isoformat(),"lead_preview":leads}
+
+
+@app.post("/page-indexer/process")
+def process_page_index(request: PageIndexerRequest, req: Request):
+    user=current_user(req); uid=uuid.UUID(user["id"])
+    url=request.url.strip()
+    if not _page_indexer_eligible(url,request.html,request.title):
+        return {"ok":True,"eligible":False,"charged_cents":0,"leads":0,"message":"Page discarded by eligibility gate."}
+    with db() as conn:
+        scrap=conn.execute("SELECT id,status,criteria FROM scraps WHERE user_id=%s AND status IN ('active','running') ORDER BY created_at DESC LIMIT 1",(uid,)).fetchone()
+        if not scrap: raise HTTPException(409,"No active Current Scrap")
+        scrap_id,scrap_status,scrap_criteria=scrap
+    fingerprint=hashlib.sha256((url+"\n"+hashlib.sha256(request.html.encode('utf-8',errors='ignore')).hexdigest()).encode()).hexdigest()
+    with db() as conn:
+        existing=conn.execute("SELECT id,status,leads_count,charged_cents,result FROM page_indexer_jobs WHERE user_id=%s AND scrap_id=%s AND fingerprint=%s",(uid,scrap_id,fingerprint)).fetchone()
+        if existing and existing[1]=='completed':
+            result=existing[4] or {}
+            return {"ok":True,"eligible":True,"duplicate":True,"job_id":str(existing[0]),"charged_cents":0,"leads":int(existing[2]),"result":result}
+        price=int(conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='page_indexer_price_cents'").fetchone()[0])
+        wallet=conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s FOR UPDATE",(uid,)).fetchone()
+        if not wallet or int(wallet[0]) < price: raise HTTPException(402,f"Insufficient balance. Page Lead Indexer costs ${price/100:.2f} per page")
+        job_id=existing[0] if existing else uuid.uuid4()
+        balance_after=int(wallet[0])-price
+        conn.execute("UPDATE wallets SET balance_cents=%s,updated_at=now() WHERE user_id=%s",(balance_after,uid))
+        conn.execute("INSERT INTO wallet_transactions(id,user_id,amount_cents,balance_after_cents,transaction_type,reference_id) VALUES(%s,%s,%s,%s,'page_indexer',%s)",(uuid.uuid4(),uid,-price,balance_after,str(job_id)+':'+str(uuid.uuid4())))
+        conn.execute("INSERT INTO page_indexer_jobs(id,user_id,scrap_id,url,fingerprint,status,charged_cents,leads_count,result,error,updated_at) VALUES(%s,%s,%s,%s,%s,'processing',%s,0,'{}',NULL,now()) ON CONFLICT(user_id,scrap_id,fingerprint) DO UPDATE SET scrap_id=EXCLUDED.scrap_id,url=EXCLUDED.url,status='processing',charged_cents=EXCLUDED.charged_cents,leads_count=0,result='{}',error=NULL,updated_at=now()",(job_id,uid,scrap_id,url,fingerprint,price))
+        conn.commit()
+    try:
+        criteria=SearchCriteria.model_validate(scrap_criteria or {})
+        prefixes,rules=get_client_policies(user["id"])
+        evidence,evidence_id=_page_indexer_evidence(scrap_id,url,request.html)
+        extractor=AdaptiveLeadExtractor(generic_prefixes=prefixes)
+        extracted=asyncio.run(extractor.extract(request.html,url,evidence=evidence))
+        if request.email_only:
+            extracted=[lead for lead in extracted if lead.email and is_personal_email(str(lead.email), prefixes)]
+        qualified=[]
+        qualifier=LeadQualifier()
+        for lead in extracted:
+            geo=_PAGE_GEOGRAPHY.classify(city=lead.city,state=lead.state,country=lead.country)
+            lead=lead.model_copy(update={"city":geo.get("city"),"state":geo.get("state"),"country":geo.get("country")})
+            if qualifier.qualify(lead,criteria).relevant:
+                qualified.append(lead)
+        final=exclude_existing(scrap_id, dedupe(qualified))
+        persisted=0
+        for lead in final:
+            if persist_lead(scrap_id,lead,evidence_id=evidence_id): persisted+=1
+        result={"url":url,"extracted":len(extracted),"qualified":len(qualified),"leads":len(final),"persisted":persisted,"charged_cents":price,"email_only":request.email_only,"lead_preview":[lead.model_dump(mode="json") for lead in final[:20]]}
+        with db() as conn:
+            conn.execute("UPDATE page_indexer_jobs SET status='completed',leads_count=%s,result=%s,error=NULL,updated_at=now() WHERE id=%s",(len(final),Jsonb(result),job_id)); conn.commit()
+        return {"ok":True,"eligible":True,"duplicate":bool(qualified) and not final,"job_id":str(job_id),**result}
+    except Exception as exc:
+        with db() as conn:
+            wallet=conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s FOR UPDATE",(uid,)).fetchone(); new_balance=int(wallet[0])+price
+            conn.execute("UPDATE wallets SET balance_cents=%s,updated_at=now() WHERE user_id=%s",(new_balance,uid))
+            conn.execute("INSERT INTO wallet_transactions(id,user_id,amount_cents,balance_after_cents,transaction_type,reference_id) VALUES(%s,%s,%s,%s,'page_indexer_refund',%s)",(uuid.uuid4(),uid,price,new_balance,str(job_id)+':refund:'+str(uuid.uuid4())))
+            conn.execute("UPDATE page_indexer_jobs SET status='refunded',charged_cents=0,error=%s,updated_at=now() WHERE id=%s",(str(exc),job_id)); conn.commit()
+        raise HTTPException(502,f"Page Lead Indexer failed; charge refunded: {exc}") from exc
 
 
 @app.post("/serp/sync")
