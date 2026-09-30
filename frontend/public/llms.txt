@@ -1,0 +1,32 @@
+# Scrappee
+
+> Scrappee is a lead intelligence workspace for discovering prospects, capturing web data, enriching records and building targeted lead lists.
+
+## Product
+
+Scrappee provides authenticated workflows for lead research, web capture, enrichment, qualification, exports, sender management, billing, support, and browser-extension handoff.
+
+## Core workflow
+
+1. Define a lead research request.
+2. Review the interpreted search criteria.
+3. Create a Scrap and generate search parameters.
+4. Capture search results through supported discovery workflows.
+5. Crawl and process collected URLs.
+6. Review, enrich, qualify, deduplicate, and export leads.
+
+## Technical architecture
+
+- Customer application: React.
+- API: FastAPI.
+- Research pipeline: Scrapy-based crawling and existing backend services.
+- Browser integration: Scrappee Browser Import extension.
+- Authentication: authenticated API sessions.
+
+## Canonical site
+
+https://scrapee.uk/
+
+## Machine-readable metadata
+
+The application publishes standard HTML metadata and Schema.org JSON-LD in its document head.

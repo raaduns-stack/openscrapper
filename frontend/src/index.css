@@ -1,0 +1,15 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+:root{
+  font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  color:#171512;background:#f7f5f0;font-synthesis:none;text-rendering:optimizeLegibility;
+  --font-ui:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --text-xs:11px;--text-sm:12px;--text-md:13px;--text-lg:15px;--text-xl:18px;--text-2xl:24px;--text-3xl:32px;--text-display:42px;
+  --weight-regular:400;--weight-medium:500;--weight-semibold:600;--weight-bold:700;--weight-extrabold:800;
+  --leading-tight:1.12;--leading-normal:1.45;--leading-relaxed:1.65;
+  --tracking-tight:-.035em;--tracking-display:-.05em;
+}
+*{box-sizing:border-box}
+body{margin:0;min-width:320px;font-family:var(--font-ui);font-size:var(--text-md);line-height:var(--leading-normal)}
+button,input,textarea,select{font:inherit}button{font-family:var(--font-ui)}a{color:inherit;text-decoration:none}
+h1,h2,h3,p{margin-top:0}h1,h2,h3{font-family:var(--font-ui);font-weight:var(--weight-bold);letter-spacing:var(--tracking-tight)}
