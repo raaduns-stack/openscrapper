@@ -1699,7 +1699,7 @@ class JobRequest(BaseModel):
 
 class SearchParameterRequest(BaseModel):
     criteria: SearchCriteria
-    max_queries: int|None=None
+    max_queries: int=Field(default=0, ge=0)
     scrap_id: str|None=None
 
 class SerpSessionRequest(BaseModel):

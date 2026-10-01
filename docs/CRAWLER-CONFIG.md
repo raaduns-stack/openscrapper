@@ -4,7 +4,7 @@ All search and crawl safety controls are centralized in `CrawlerConfig`.
 
 ## Configurable limits
 
-- `max_queries`: maximum search queries per discovery plan.
+- `max_queries`: optional overall search-query ceiling; `0` means unlimited. The deterministic template generator does not divide this ceiling between Google and Bing.
 - `provider_failure_limit`: consecutive failures allowed for a provider.
 - `url_deduplication`: enable URL duplicate suppression.
 - `url_validity_checks`: reject malformed/non-HTTP(S) URLs.

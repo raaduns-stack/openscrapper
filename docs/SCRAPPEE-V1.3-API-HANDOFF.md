@@ -108,7 +108,7 @@ Request:
 {
   "scrap_id": "uuid-or-null",
   "criteria": {},
-  "max_queries": 20
+  "max_queries": 0
 }
 ```
 Response: `{ "parameters": [...] }`.

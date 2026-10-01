@@ -128,60 +128,80 @@ class GeographyResolver:
         with open(self.data_dir / filename, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def resolve_values(self, value: str) -> list[str]:
-        """Resolve country/state/city input into verified geography values.
+    def classify_values(self, value: str) -> dict[str, list[str]]:
+        """Classify one geography input into country/state/city substitution levels.
 
-        Country expands to country + states + cities; state expands to state + cities;
-        city remains the verified city. Ambiguous or unknown values are preserved.
+        geography-1 = country, geography-2 = state/province/region,
+        geography-3 = city. Values are always derived from the bundled
+        country/state/city hierarchy; no geography is invented.
         """
         raw = str(value or "").strip()
         if not raw:
-            return [""]
-        norm = self._norm(raw)
+            return {"geography-1": [""], "geography-2": [""], "geography-3": [""]}
 
-        if norm in self._country_index:
-            result = self.resolve(raw)
-            values = [result.country]
-            for state in result.states:
-                values.append(state.name)
-                values.extend(state.cities)
-            return list(dict.fromkeys(v for v in values if v))
+        norm = self._norm(raw)
+        country = self._country_index.get(norm)
+        if country:
+            result = self.resolve(country.get("name", raw))
+            return {
+                "geography-1": [result.country],
+                "geography-2": [state.name for state in result.states],
+                "geography-3": [city for state in result.states for city in state.cities],
+            }
 
         state_matches = []
-        for country in self.countries:
-            country_id = country.get("id")
+        for country_record in self.countries:
+            country_id = country_record.get("id")
             state_record = next((r for r in self.states if r.get("id") == country_id), None)
             for state in (state_record.get("states", []) if state_record else []):
                 if self._norm(state.get("name")) == norm:
-                    state_matches.append((country_id, state))
+                    state_matches.append((country_record, state))
 
         if len(state_matches) == 1:
-            country_id, state = state_matches[0]
-            city_record = next((r for r in self.cities if r.get("id") == country_id), None)
-            city_states = {
-                item.get("id"): item.get("cities", [])
-                for item in (city_record.get("states", []) if city_record else [])
+            country_record, state = state_matches[0]
+            city_record = next((r for r in self.cities if r.get("id") == country_record.get("id")), None)
+            cities = []
+            for state_item in (city_record.get("states", []) if city_record else []):
+                if state_item.get("id") == state.get("id"):
+                    cities = sorted({str(c.get("name")).strip() for c in state_item.get("cities", []) if c.get("name")})
+                    break
+            return {
+                "geography-1": [str(country_record.get("name")).strip()],
+                "geography-2": [str(state.get("name")).strip()],
+                "geography-3": cities,
             }
-            cities = sorted({
-                str(city.get("name")).strip()
-                for city in city_states.get(state.get("id"), [])
-                if city.get("name")
-            })
-            return list(dict.fromkeys([str(state.get("name")).strip(), *cities]))
 
         city_matches = []
-        for country in self.countries:
-            country_id = country.get("id")
+        for country_record in self.countries:
+            country_id = country_record.get("id")
             city_record = next((r for r in self.cities if r.get("id") == country_id), None)
             for state in (city_record.get("states", []) if city_record else []):
                 for city in state.get("cities", []):
                     if self._norm(city.get("name")) == norm:
-                        city_matches.append(city.get("name"))
+                        city_matches.append((country_record, state, city))
 
-        if len(set(city_matches)) == 1:
-            return [str(city_matches[0]).strip()]
+        if len(city_matches) == 1:
+            country_record, state, city = city_matches[0]
+            state_record = next((r for r in self.states if r.get("id") == country_record.get("id")), None)
+            canonical_state = next((item for item in (state_record.get("states", []) if state_record else []) if item.get("id") == state.get("id")), None)
+            return {
+                "geography-1": [str(country_record.get("name")).strip()],
+                "geography-2": [str((canonical_state or state).get("name")).strip()],
+                "geography-3": [str(city.get("name")).strip()],
+            }
 
-        return [raw]
+        # Unknown/ambiguous input is preserved at level 1 only; lower levels
+        # are empty rather than guessed.
+        return {"geography-1": [raw], "geography-2": [], "geography-3": []}
+
+    def resolve_values(self, value: str) -> list[str]:
+        """Backward-compatible flattened geography values.
+
+        New template code should use classify_values() and explicit
+        geography-1/2/3 variables instead.
+        """
+        classified = self.classify_values(value)
+        return list(dict.fromkeys(v for level in ("geography-1", "geography-2", "geography-3") for v in classified[level] if v))
 
     def resolve(self, country_name: str) -> GeographyResult:
         country = next(

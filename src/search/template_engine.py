@@ -3,8 +3,8 @@ import re
 from src.models.criteria import SearchCriteria
 from src.agent.geography import GeographyResolver
 
-VARIABLES = {"industry", "product", "geography", "role", "keyword", "target_type"}
-VAR_RE = re.compile(r"{([a-z_]+)}")
+VARIABLES = {"industry", "product", "geography-1", "geography-2", "geography-3", "role", "keyword", "target_type"}
+VAR_RE = re.compile(r"{([a-z0-9_-]+)}")
 
 @dataclass(frozen=True)
 class TemplateParameter:
@@ -25,23 +25,23 @@ class SearchTemplateEngine:
         self.geography = GeographyResolver()
 
     def _geography_values(self, value):
-        raw = str(value or "").strip()
-        if not raw:
-            return [""]
-        return self.geography.resolve_values(raw)
+        return self.geography.classify_values(value)
 
     def _values(self, criteria):
+        geography = self._geography_values(criteria.geography)
         return {
             "industry": [criteria.industry],
             "product": [criteria.product or criteria.industry],
-            "geography": self._geography_values(criteria.geography),
+            "geography-1": geography["geography-1"],
+            "geography-2": geography["geography-2"],
+            "geography-3": geography["geography-3"],
             "role": criteria.roles or [""],
             "keyword": criteria.keywords or [""],
             "target_type": [criteria.target_type],
         }
 
     def generate(self, criteria: SearchCriteria, max_queries: int|None = None):
-        if max_queries is not None and max_queries <= 0:
+        if max_queries is not None and max_queries < 0:
             return []
         rows = self.conn.execute(
             "SELECT t.id,t.category_id,t.provider,t.template,t.family,c.name "
@@ -50,16 +50,8 @@ class SearchTemplateEngine:
         ).fetchall()
         values = self._values(criteria)
         params=[]; seen=set()
-        providers=[p for p in ("google","bing") if any(r[2]==p for r in rows)]
-        if max_queries is not None and providers:
-            provider_limits={p:max_queries//len(providers) for p in providers}
-            for p in providers[:max_queries % len(providers)]: provider_limits[p]+=1
-        else:
-            provider_limits={p:max_queries for p in providers}
-        provider_counts={p:0 for p in providers}
+        limit = None if max_queries in (None, 0) else max_queries
         for tid,cid,provider,template,family,category in rows:
-            if max_queries is not None and provider_counts.get(provider,0) >= provider_limits.get(provider,0):
-                continue
             variables=VAR_RE.findall(template)
             if any(v not in VARIABLES for v in variables):
                 continue
@@ -71,10 +63,8 @@ class SearchTemplateEngine:
                         nxt.append({**combo,var:value})
                 combos=nxt
             for resolved in combos:
-                if max_queries is not None and len(params) >= max_queries:
+                if limit is not None and len(params) >= limit:
                     return params
-                if max_queries is not None and provider_counts.get(provider,0) >= provider_limits.get(provider,0):
-                    continue
                 query=" ".join(template.format(**resolved).split()).strip()
                 key=(provider,query.casefold())
                 if not query or key in seen:
@@ -85,5 +75,4 @@ class SearchTemplateEngine:
                 seen.add(key)
                 ident=f"{provider}-{len(params)+1}"
                 params.append(TemplateParameter(ident,provider,query,adapter.build_url(query),family,category,str(tid),resolved))
-                provider_counts[provider]=provider_counts.get(provider,0)+1
         return params

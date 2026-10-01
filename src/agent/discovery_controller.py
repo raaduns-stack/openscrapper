@@ -21,7 +21,8 @@ class DiscoveryController:
         self.config = config or CrawlerConfig()
 
     def plan(self, criteria: SearchCriteria) -> DiscoveryPlan:
-        query_budget = min(self.config.max_queries, max(10, criteria.max_leads // 5))
+        base_budget = max(10, criteria.max_leads // 5)
+        query_budget = base_budget if self.config.max_queries == 0 else min(self.config.max_queries, base_budget)
         queries = self.expander.expand(
             criteria,
             max_queries=query_budget,

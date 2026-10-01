@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field, field_validator
 class CrawlerConfig(BaseModel):
     """User-configurable search and crawling safety limits."""
 
-    max_queries: int = Field(default=20, ge=1, le=500)
+    max_queries: int = Field(default=0, ge=0)
     provider_failure_limit: int = Field(default=2, ge=1, le=20)
     url_validity_checks: bool = True
     max_crawl_pages: int | None = Field(default=None, ge=1, le=10000)
