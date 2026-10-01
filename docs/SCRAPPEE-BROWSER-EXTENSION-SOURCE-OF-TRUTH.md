@@ -145,6 +145,44 @@ The backend controls the price. The default commercial price is **$0.01 per elig
 - Failed backend/provider processing is refunded by the backend.
 
 
+
+
+## Extension Popup — Approved Navigation Contract
+
+The popup MUST separate the two acquisition workflows while keeping the shared research metrics visible at the top.
+
+### Fixed top section
+- Extension identity/version.
+- Authentication state.
+- Current Scrap and status.
+- A single three-metric strip immediately below Current Scrap:
+  - **SERP Captured** — Google/Bing search results captured for the Current Scrap.
+  - **Page Leads** — leads produced by the most recent Page Lead Indexer operation.
+  - **Page Indexer** — charge for the most recent indexed page.
+- The three metrics MUST appear together at the top and MUST NOT be duplicated lower in the popup.
+
+### Tabs
+The popup then exposes exactly two primary workflow tabs:
+
+1. **Google / Bing Searches**
+   - Email only control.
+   - SERP collection controls.
+   - Start/stop/resume SERP collection.
+   - CAPTCHA/challenge status.
+   - Local SERP preview/clear controls.
+
+2. **Page Leads Capture**
+   - Email only control.
+   - Auto Indexing control; default **OFF** for new installations.
+   - **INDEX THIS PAGE**.
+   - Last indexed page status and charge.
+   - **VIEW LAST INDEXED LEADS**.
+   - Indexed lead results.
+
+The tabs are presentation-only. They MUST NOT create separate backend pipelines, alter authentication, alter billing, or alter Current Scrap semantics.
+
+The shared top metrics remain visible regardless of the selected tab.
+
 ## Page Lead Indexer — Approved UI Contract
 
 **Email-only integration:** When Email only is ON, Page Lead Indexer MUST submit only extracted leads containing a valid personal email. Leads without email or with generic mailbox prefixes are discarded before qualification/persistence. When Email only is OFF, the normal accepted-lead paths remain available.
@@ -161,3 +199,12 @@ Approved interaction and display:
 - Lead preview cards show available name, position/company, email/phone, geography, and source URL.
 - Existing SERP controls remain unchanged.
 - No UI action may bypass backend billing, validation, qualification, deduplication, or persistence rules.
+
+
+### Popup visual contract — clean header and connection status
+
+The popup header is intentionally compact: Scrappee identity/version, a live connection-status badge, and the Current Scrap name/status. The three shared metrics remain immediately below. Backend implementation details MUST NOT be presented as explanatory prose in the user-facing popup.
+
+The footer uses concise product chrome only: copyright, connection/security wording, Refresh, and Log out.
+
+The popup navigation uses two tabs. Tab switching is client-side presentation only and MUST remain functional independently of backend state.

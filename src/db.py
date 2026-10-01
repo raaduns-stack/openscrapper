@@ -11,8 +11,10 @@ SESSION_IDLE_MINUTES = int(os.getenv("SCRAPPEE_SESSION_IDLE_MINUTES", "20"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
- id UUID PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+ id UUID PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('user','admin')), created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE users ADD COLUMN IF NOT EXISTS country TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS wallets (
  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, balance_cents BIGINT NOT NULL DEFAULT 0 CHECK(balance_cents >= 0), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -76,10 +78,30 @@ CREATE TABLE IF NOT EXISTS generic_mailbox_prefixes (
 CREATE TABLE IF NOT EXISTS domain_rules (
  id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, domain TEXT NOT NULL, rule_type TEXT NOT NULL CHECK(rule_type IN ('blacklist','whitelist')), created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(user_id, domain, rule_type)
 );
+CREATE TABLE IF NOT EXISTS global_domain_blacklist (
+ id UUID PRIMARY KEY, domain TEXT NOT NULL UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_global_domain_blacklist_domain ON global_domain_blacklist(domain);
 CREATE TABLE IF NOT EXISTS sessions (
  id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, token_hash TEXT UNIQUE NOT NULL, expires_at TIMESTAMPTZ NOT NULL, persistent BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+ id UUID PRIMARY KEY,
+ user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ token_hash TEXT UNIQUE NOT NULL,
+ expires_at TIMESTAMPTZ NOT NULL,
+ used_at TIMESTAMPTZ,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user ON password_reset_tokens(user_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expiry ON password_reset_tokens(expires_at);
+
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS persistent BOOLEAN NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS admin_audit_events (
+ id UUID PRIMARY KEY, actor_id UUID REFERENCES users(id) ON DELETE SET NULL, target_user_id UUID REFERENCES users(id) ON DELETE SET NULL, action TEXT NOT NULL, module TEXT NOT NULL, result TEXT NOT NULL DEFAULT 'success', metadata JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_target ON admin_audit_events(target_user_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit_events(created_at DESC);
 CREATE TABLE IF NOT EXISTS extension_connections (
  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, version TEXT NOT NULL, last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -245,6 +267,10 @@ def db():
 def init_db():
     with db() as conn:
         conn.execute(SCHEMA)
+        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'")
+        conn.execute("UPDATE users u SET last_login_at=s.last_login_at FROM (SELECT user_id, MAX(created_at) AS last_login_at FROM sessions GROUP BY user_id) s WHERE u.id=s.user_id AND u.last_login_at IS NULL")
+        conn.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check")
+        conn.execute("ALTER TABLE users ADD CONSTRAINT users_role_check CHECK(role IN ('user','admin'))")
         conn.execute("ALTER TABLE sender_oauth_states ALTER COLUMN sender_id DROP NOT NULL")
         conn.execute("ALTER TABLE wallet_deposits ADD COLUMN IF NOT EXISTS asset TEXT NOT NULL DEFAULT 'BTC'")
         conn.execute("ALTER TABLE sender_oauth_states ADD COLUMN IF NOT EXISTS display_name TEXT")
@@ -300,5 +326,5 @@ def get_client_policies(user_id):
     import uuid
     with db() as conn:
         prefixes = {r[0] for r in conn.execute("SELECT prefix FROM generic_mailbox_prefixes WHERE user_id=%s", (uuid.UUID(str(user_id)),)).fetchall()}
-        rules = [(r[0], r[1]) for r in conn.execute("SELECT domain,rule_type FROM domain_rules WHERE user_id=%s", (uuid.UUID(str(user_id)),)).fetchall()]
+        rules = [(r[0], "blacklist") for r in conn.execute("SELECT domain FROM global_domain_blacklist").fetchall()] + [(r[0], r[1]) for r in conn.execute("SELECT domain,rule_type FROM domain_rules WHERE user_id=%s", (uuid.UUID(str(user_id)),)).fetchall()]
     return prefixes, rules

@@ -106,6 +106,23 @@ Navigation and information hierarchy must keep sender configuration, campaign de
 
 ## 7. Admin UI
 
+### 7.1 Separate Admin Application Surface
+
+Admin is a **separate application interface** from the customer-facing Scrappee workspace.
+
+- Admin is accessed at the dedicated `/admin` route/application surface.
+- `/admin` must render a complete Admin interface with its own navigation, layout, information hierarchy, and operational workflows.
+- The normal customer-facing interface must not be embedded inside the Admin interface, and customer navigation must not be reused as the Admin navigation.
+- The Admin interface must not appear as a normal customer navigation item.
+- Admin and customer surfaces may reuse shared frontend primitives/components where appropriate, but they remain separate application experiences.
+- The Admin interface must provide a clear **switch-to-user-interface** control/icon allowing an authorized administrator to return to the normal customer-facing Scrappee workspace.
+- The user-facing interface must provide a corresponding **switch-to-admin** control only when the authenticated server-side identity is authorized as an administrator.
+- The switch controls are navigation conveniences only; they are never authorization mechanisms.
+- Direct navigation to `/admin` and every Admin API request must continue to enforce server-side administrator authorization.
+- A non-admin user must receive an authorization failure and must not gain Admin functionality by manually navigating to `/admin` or calling Admin APIs.
+
+### 7.2 Admin Boundary
+
 Admin is a separate application surface and must not be mixed into normal customer navigation/content.
 
 ```text
@@ -199,3 +216,425 @@ All implementation commits remain local by default. No push or merge to stable/m
 4. Antigravity MUST NOT git push, merge, rebase stable/main, reset/clean the working tree, or modify unrelated existing changes without explicit CTO authorization.
 5. All implementation remains local until the CTO explicitly authorizes publication/release.
 6. Existing unrelated working-tree changes must be preserved.
+
+## 7.3 Approved Admin Console Functional Scope
+
+**CTO approval:** Approved on 2026-09-29. This section is the source-of-truth baseline for the React Admin Console. It defines the intended administration scope; implementation of capabilities not already backed by the API requires separate engineering validation and must not invent backend behavior.
+
+### Admin navigation
+
+```text
+ADMIN
+
+OPERATIONS
+  Overview
+  Activity
+  System health
+
+CUSTOMERS
+  Users
+  Customer activity
+
+BILLING
+  Wallets
+  Deposits
+  Transactions
+
+RESEARCH
+  Scraps
+  SERP providers
+  Search templates
+
+OUTBOUND
+  Campaigns
+  Senders
+
+SUPPORT
+  Tickets
+
+PLATFORM
+  Pricing
+  Research settings
+  Client policies
+  Platform settings
+
+SECURITY
+  Audit log
+  Administrators
+```
+
+Bottom navigation must retain:
+
+- Switch to User Interface
+- Log out
+
+### 7.3.1 Overview
+
+The Admin overview is an operational dashboard, not a duplicate customer dashboard.
+
+Platform health:
+
+- API status
+- Database status
+- scraping/pipeline status
+- queue/job status
+- browser-extension/service status
+- email delivery status
+- payment processor status
+- premium SERP provider status
+
+Customer metrics:
+
+- total users
+- active users
+- suspended users
+- new users by time period
+- users currently scraping
+- users with active campaigns
+- users with outstanding support tickets
+
+Financial metrics:
+
+- total wallet balance
+- pending deposits
+- deposits by period
+- revenue
+- admin credits/debits
+- failed payments
+
+Research metrics:
+
+- Scraps by period
+- SERP usage
+- URLs crawled
+- leads discovered
+- leads approved
+- paid enrichment jobs
+- premium SERP usage
+- page-indexer usage
+
+### 7.3.2 Users
+
+Users is a customer-administration workstation, not a delete-only table.
+
+User list must support:
+
+- search by email and supported customer identifiers
+- filtering by account status
+- filtering by admin/non-admin role
+- filtering by activity and billing state
+- pagination
+- selection and bulk operations where server support exists
+
+List information should include, where available from the API:
+
+- status
+- email
+- name/company if supported
+- created date
+- last login/activity
+- wallet balance
+- deposits
+- Scraps
+- leads
+- campaigns
+- support tickets
+
+Supported administrative operations must be exposed only when backed by server-side endpoints. Existing functionality includes user deletion/bulk deletion and wallet adjustment.
+
+### 7.3.3 User Detail
+
+Selecting a customer opens a dedicated user administration workspace.
+
+```text
+Customer
+email
+STATUS
+Created
+Last login
+
+[ Suspend ] [ Adjust wallet ] [ Force logout ]
+
+Overview | Activity | Wallet | Deposits | Scraps | Leads | Campaigns | Support | Security
+```
+
+The detail workspace must centralize customer context rather than requiring the administrator to infer state from separate lists.
+
+### 7.3.4 User Activity
+
+The approved target is a chronological customer activity timeline covering, where data is retained:
+
+Authentication:
+
+- login
+- logout
+- failed login
+- password reset
+- session creation/expiration
+- forced logout
+
+Research:
+
+- Scrap creation/submission/completion
+- SERP activity
+- URL submission
+- crawl activity
+- lead discovery/approval/deletion
+- enrichment requests/completion
+
+Billing:
+
+- deposit creation/approval/rejection
+- wallet charges
+- wallet credits/debits
+- admin adjustments
+- refunds/corrections
+
+Campaigns:
+
+- campaign creation/change
+- launch/pause/resume where supported
+- test sends
+- successful/failed sends
+- replies
+
+Support:
+
+- ticket creation
+- replies
+- assignment
+- status changes
+- resolution/reopening
+- ratings
+
+This requires an auditable event model. Existing support audit events must not be assumed to cover system-wide customer activity.
+
+### 7.3.5 Account Lifecycle
+
+Target account states:
+
+```text
+Active
+Suspended
+Pending
+Deleted
+```
+
+Suspension is an approved target capability but is **not currently assumed to exist** merely because the UI exposes it. Before implementation, the backend/database must be audited and a server-side lifecycle model added if required.
+
+Suspension requirements:
+
+- reason
+- optional internal note
+- optional customer-facing message
+- indefinite or scheduled duration
+- session invalidation
+- login enforcement
+- research/campaign enforcement as applicable
+- immutable audit event
+
+Deletion must protect the current administrator and must not permit removing the last administrator.
+
+### 7.3.6 Wallets and Transactions
+
+Wallet administration must provide:
+
+- current balance
+- available credits
+- total deposited
+- total spent
+- total admin adjustments
+- transaction ledger
+
+Transaction records should expose, where supported:
+
+- timestamp
+- type
+- amount
+- balance after
+- reference
+- source
+- administrator for administrative adjustments
+
+Target transaction categories include deposits, product charges, admin credit/debit, refunds, and corrections.
+
+Existing server capability includes `/admin/wallet-adjust`; the React UI must require a reason for administrative adjustments once the backend contract supports it and must record the action in the audit trail.
+
+### 7.3.7 Deposits
+
+Admin deposit management must support:
+
+- pending/approved/rejected/expired filtering
+- customer
+- payment method
+- amount
+- reference
+- created/reviewed timestamps
+- reviewer
+- deposit detail
+- approve/reject actions where server-authorized
+- internal notes where supported
+
+Existing server functionality includes deposit listing and review.
+
+### 7.3.8 Support
+
+Admin Support must expose the existing server-backed workflow:
+
+- queue by status
+- priority/category filters
+- customer search
+- assignee filtering
+- ticket detail
+- conversation
+- attachments
+- internal notes
+- assignment/reassignment
+- priority/status changes
+- resolve/reopen/close
+- customer rating
+
+Existing server endpoints include support metrics, ticket listing/detail, messages, internal notes, status, assignment, assignees, and attachment download.
+
+### 7.3.9 Research Administration
+
+Admin research visibility should cover customer Scraps and their operational state:
+
+- Scrap status
+- created/completed times
+- SERP results
+- URLs/pages crawled
+- leads
+- job status/final stage
+- pipeline events/errors
+- usage/cost where available
+
+Administrative retry/cancel operations must only be exposed after confirming safe server-side contracts.
+
+### 7.3.10 Campaign and Sender Administration
+
+Admin should provide operational visibility into customer campaigns and sender identities:
+
+- customer
+- campaign status
+- sender
+- letter/audience
+- sent/failed/replied counts
+- sender provider/health
+- enabled state
+
+Pause/resume/cancel/disable operations require explicit server-side support and auditability.
+
+Secrets such as SMTP passwords or OAuth credentials must never be displayed.
+
+### 7.3.11 SERP, Search Templates and Research Controls
+
+Existing admin-backed controls include:
+
+- premium SERP providers
+- provider enablement/configuration
+- search-template categories
+- search templates
+- search-template ordering
+- global SERP limit
+- research settings
+
+React Admin must expose the existing server contracts without changing their semantics.
+
+### 7.3.12 Pricing and Platform Configuration
+
+Existing administrative pricing/configuration includes:
+
+- Scrap price
+- paid enrichment price
+- premium SERP price
+- page-indexer price
+- SERP limit
+- deposit configuration
+- research settings
+- platform settings
+
+Configuration changes must show current value, proposed value, administrator, timestamp, and audit event where the backend supports auditability.
+
+### 7.3.13 Client Policies
+
+Admin must distinguish global policies from customer-specific policies.
+
+Global:
+
+- domain blacklist
+- policies applying to all customers/crawlers
+
+Customer-specific:
+
+- mailbox-prefix exclusions
+- supported customer-specific collection rules
+
+Existing server-backed domain blacklist and client-policy functionality must remain intact during React migration.
+
+### 7.3.14 Audit Log
+
+A system-wide Admin Audit Log is an approved target capability.
+
+Each auditable event should record:
+
+- timestamp
+- actor
+- action
+- target
+- module
+- result
+- metadata/reason where appropriate
+
+High-risk actions requiring auditability include:
+
+- user lifecycle changes
+- wallet adjustments
+- deposit decisions
+- pricing/configuration changes
+- support administration
+- provider/configuration changes
+- destructive operations
+
+Existing support audit events are not considered a substitute for a system-wide audit log.
+
+### 7.3.15 Administrator Roles and Permissions
+
+The approved target model supports future role separation:
+
+```text
+Super Admin
+Support Admin
+Billing Admin
+Operations Admin
+Read Only
+```
+
+Permission enforcement must be server-side. The React UI may hide unavailable actions for usability but must never be the authorization layer.
+
+This role model is a target capability and is not considered implemented until the backend authorization model explicitly supports it.
+
+### 7.3.16 Security Requirements
+
+Admin must enforce:
+
+- server-side authorization on every Admin endpoint
+- safe session handling
+- audit logging for sensitive actions
+- confirmation for destructive/financial/account actions
+- protection against deleting the current administrator
+- protection against removing the last administrator
+- no secret exposure
+- appropriate rate limiting and request protection
+
+The switch-to-admin and switch-to-user controls are navigation only and never confer authorization.
+
+### 7.3.17 Implementation Rule
+
+The Admin React implementation must distinguish three states:
+
+1. **Existing backend capability** — expose it in React using the existing contract.
+2. **Existing legacy UI behavior without complete React/API parity** — preserve behavior and audit the contract before implementing.
+3. **Approved target capability not currently backed by the server** — document and engineer the backend contract first; do not fabricate client-side state or authorization.
+
+No Admin feature may be represented as operationally complete until its server-side authorization, persistence semantics, and failure paths are validated.

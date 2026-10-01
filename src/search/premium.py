@@ -65,7 +65,12 @@ def provider_statuses() -> list[dict[str, Any]]:
     from src.db import db
     with db() as conn:
         rows = conn.execute("SELECT provider,enabled,is_default,credentials,settings,updated_at FROM premium_provider_configs ORDER BY provider").fetchall()
-    return [{"provider": r[0], "enabled": bool(r[1]), "is_default": bool(r[2]), "configured": bool(r[3]), "settings": r[4] or {}, "updated_at": r[5].isoformat()} for r in rows]
+        invalid = [r[0] for r in rows if bool(r[1]) and not bool(r[3])]
+        if invalid:
+            conn.execute("UPDATE premium_provider_configs SET enabled=false,is_default=false,updated_at=now() WHERE provider=ANY(%s)", (invalid,))
+            conn.commit()
+            rows = conn.execute("SELECT provider,enabled,is_default,credentials,settings,updated_at FROM premium_provider_configs ORDER BY provider").fetchall()
+    return [{"provider": r[0], "enabled": bool(r[1]) and bool(r[3]), "is_default": bool(r[2]) and bool(r[3]), "configured": bool(r[3]), "settings": r[4] or {}, "updated_at": r[5].isoformat()} for r in rows]
 
 
 def _load_config(provider: str | None = None) -> tuple[str, dict[str, str], dict[str, Any]]:
@@ -88,9 +93,13 @@ def save_provider_config(provider: str, credentials: dict[str, str], settings: d
         current = conn.execute("SELECT credentials FROM premium_provider_configs WHERE provider=%s", (provider,)).fetchone()
         merged = decrypt_credentials(current[0]) if current and current[0] else {}
         merged.update({k: v for k, v in credentials.items() if str(v).strip()})
+        if enabled and not merged:
+            raise ValueError("Provider must be configured before it can be enabled")
         if make_default:
             if not enabled:
                 raise ValueError("Default provider must be enabled")
+            if not merged:
+                raise ValueError("Default provider must be configured")
             conn.execute("UPDATE premium_provider_configs SET is_default=false WHERE provider<>%s", (provider,))
         conn.execute("UPDATE premium_provider_configs SET enabled=%s,is_default=%s,credentials=%s,settings=%s,updated_at=now() WHERE provider=%s", (enabled, make_default, encrypt_credentials(merged) if merged else None, json.dumps(settings), provider))
         if not make_default:

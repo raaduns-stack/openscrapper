@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
-import asyncio, secrets, time, uuid, os, math, logging, re
+import asyncio, secrets, time, uuid, os, math, logging, re, subprocess, smtplib, ssl, base64
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
@@ -17,6 +17,7 @@ from src.extract.adaptive import AdaptiveLeadExtractor
 from src.extract.evidence import EvidenceBuilder
 from src.extract.email import is_personal_email
 from src.agent.qualification import LeadQualifier
+from src.agent.query_interpreter import QueryInterpreter
 from src.agent.geography import GeographyResolver
 from src.dedupe.leads import persist_lead, dedupe, exclude_existing
 from src.observability.job_events import JobEventSink, emit_event
@@ -24,7 +25,7 @@ from src.search.strategy import SearchStrategyEngine
 from src.search.template_engine import SearchTemplateEngine, VARIABLES
 from src.search.premium import HttpPremiumSerpProvider, parse_search_url, SUPPORTED_PROVIDERS, provider_statuses, save_provider_config
 from src.db import db, init_db, purge_expired_history, get_client_policies
-from src.auth import create_user, login_user, current_user, create_session
+from src.auth import create_user, login_user, current_user, create_session, request_password_reset, reset_password
 from src.payments_btcpay import configured as btcpay_configured, create_invoice as btcpay_create_invoice, verify_webhook as btcpay_verify_webhook, payment_btc as btcpay_payment_btc
 import hashlib
 from psycopg.types.json import Jsonb
@@ -115,6 +116,7 @@ def download_extension_v068():
 class AuthRequest(BaseModel):
     email: str
     password: str=Field(min_length=8,max_length=200)
+    country: str | None = Field(default=None, min_length=2, max_length=2)
 
 class MailboxPrefixRequest(BaseModel):
     prefix: str = Field(min_length=1, max_length=100)
@@ -406,12 +408,91 @@ def admin_support_assignment(ticket_id: str, request: SupportAssignmentRequest, 
     if not item: raise HTTPException(404, "Ticket not found")
     return item
 
+@app.get("/auth/countries")
+def auth_countries():
+    import json
+    path=Path(__file__).resolve().parents[1] / "data" / "geography" / "countriesminified.json"
+    try:
+        rows=json.loads(path.read_text())
+    except Exception as exc:
+        raise HTTPException(500,"Country list unavailable") from exc
+    return [{"name":x["name"],"iso2":x["iso2"]} for x in rows if x.get("name") and x.get("iso2")]
+
+@app.get("/auth/country")
+def auth_country(req: Request):
+    code=(req.headers.get("CF-IPCountry") or req.headers.get("X-Country-Code") or "").strip().upper()
+    if len(code)==2 and code.isalpha(): return {"iso2":code,"source":"proxy"}
+    client_ip=(req.client.host if req.client else "").strip()
+    if not client_ip or client_ip in {"127.0.0.1","::1"}: return {"iso2":None,"source":"unavailable"}
+    try:
+        from urllib.request import Request as UrlRequest,urlopen
+        payload=urlopen(UrlRequest("https://ipapi.co/"+client_ip+"/country/",headers={"User-Agent":"Scrappee/1.0"}),timeout=3).read().decode().strip().upper()
+        if len(payload)==2 and payload.isalpha(): return {"iso2":payload,"source":"ipapi"}
+    except Exception:
+        pass
+    return {"iso2":None,"source":"unavailable"}
+
 @app.post("/auth/register")
 def register(request: AuthRequest):
-    try: user_id=create_user(request.email,request.password)
+    country=request.country.upper() if request.country else None
+    if country and not country.isalpha(): raise HTTPException(422,"Invalid country code")
+    try: user_id=create_user(request.email,request.password,country=country)
     except Exception as exc: raise HTTPException(409,"Email already registered") from exc
-    token,expires=login_user(request.email,request.password,persistent=True)
-    return {"user_id":user_id,"email":request.email.lower().strip(),"token":token,"expires_at":expires.isoformat()}
+    return {"user_id":user_id,"email":request.email.lower().strip(),"registered":True}
+
+class PasswordResetRequest(BaseModel):
+    email: str
+
+class PasswordResetConfirm(BaseModel):
+    token: str
+    password: str = Field(min_length=8, max_length=200)
+
+def _send_password_reset_email(email, token):
+    base_url=os.getenv("SCRAPPEE_APP_URL","https://scrapee.uk").rstrip("/")
+    from_address=os.getenv("SCRAPPEE_MAIL_FROM","Scrappee <noreply@scrapee.uk>")
+    link=f"{base_url}/login?reset_token={token}"
+    msg=f"""From: {from_address}
+To: {email}
+Subject: Reset your Scrappee password
+Content-Type: text/plain; charset=UTF-8
+
+We received a request to reset your Scrappee password.
+
+Reset your password:
+{link}
+
+This link expires in 60 minutes and can only be used once.
+
+If you did not request this, you can safely ignore this email.
+"""
+    smtp_host=os.getenv("SCRAPPEE_SMTP_HOST","")
+    smtp_port=int(os.getenv("SCRAPPEE_SMTP_PORT","465"))
+    smtp_user=os.getenv("SCRAPPEE_SMTP_USER","")
+    smtp_password=os.getenv("SCRAPPEE_SMTP_PASSWORD","") or base64.b64decode(os.getenv("SCRAPPEE_SMTP_PASSWORD_B64","")).decode()
+    if not smtp_host or not smtp_user or not smtp_password:
+        raise RuntimeError("SMTP password reset delivery is not configured")
+    context=ssl.create_default_context()
+    with smtplib.SMTP_SSL(smtp_host,smtp_port,context=context,timeout=15) as smtp:
+        smtp.login(smtp_user,smtp_password)
+        smtp.sendmail(from_address,[email],msg)
+
+@app.post("/auth/forgot-password")
+def forgot_password(payload: PasswordResetRequest, background_tasks: BackgroundTasks):
+    normalized=payload.email.lower().strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",normalized):
+        raise HTTPException(422,"Enter a valid email address")
+    reset=request_password_reset(normalized)
+    if reset:
+        try:
+            _send_password_reset_email(reset["email"],reset["token"])
+        except Exception:
+            logging.exception("Password reset email delivery failed")
+    return {"message":"If an account exists for that email, a password reset link has been sent."}
+
+@app.post("/auth/reset-password")
+def confirm_password_reset(payload: PasswordResetConfirm):
+    reset_password(payload.token,payload.password)
+    return {"message":"Password updated successfully. You can now sign in."}
 
 @app.post("/auth/login")
 def login(request: AuthRequest, req: Request):
@@ -435,243 +516,10 @@ def logout(request: Request):
 
 @app.get("/auth/me")
 def me(request: Request):
-    user=current_user(request); return {"id":user["id"],"email":user["email"]}
-
-
-LATEST_EXTENSION_VERSION = "0.6.12"
-
-class ExtensionHeartbeatRequest(BaseModel):
-    version: str = Field(min_length=1, max_length=32)
-
-@app.post("/extension/heartbeat")
-def extension_heartbeat(request: ExtensionHeartbeatRequest, req: Request):
-    user = current_user(req)
-    if req.headers.get("X-Scrappee-Extension") != "1":
-        raise HTTPException(403, "Extension client required")
+    user=current_user(request)
     with db() as conn:
-        conn.execute("""INSERT INTO extension_connections(user_id,version,last_seen_at,updated_at)
-            VALUES(%s,%s,now(),now())
-            ON CONFLICT(user_id) DO UPDATE SET version=EXCLUDED.version,last_seen_at=now(),updated_at=now()""",
-            (uuid.UUID(user["id"]), request.version))
-        conn.commit()
-    return {"ok": True, "version": request.version, "latest_version": LATEST_EXTENSION_VERSION}
-
-@app.get("/extension/status")
-def extension_status(req: Request):
-    user = current_user(req)
-    with db() as conn:
-        row = conn.execute("SELECT version,last_seen_at FROM extension_connections WHERE user_id=%s", (uuid.UUID(user["id"]),)).fetchone()
-    if not row:
-        return {"connected": False, "version": None, "latest_version": LATEST_EXTENSION_VERSION, "last_seen_at": None, "outdated": False}
-    version, last_seen = row
-    connected = (time.time() - last_seen.timestamp()) <= 120
-    return {"connected": connected, "version": version, "latest_version": LATEST_EXTENSION_VERSION, "last_seen_at": last_seen.isoformat(), "outdated": connected and version != LATEST_EXTENSION_VERSION}
-
-@app.get('/downloads/scrappee-browser-import-v0.6.12.zip', include_in_schema=False)
-def download_extension_v0612():
-    path=DOWNLOADS_DIR / 'Scrappee-Browser-Import-v0.6.12.zip'
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail='Extension package not found')
-    return FileResponse(path, media_type='application/zip', filename=path.name)
-
-
-@app.get('/downloads/scrappee-browser-import-v0.6.11.zip', include_in_schema=False)
-def download_extension_v0611():
-    path=DOWNLOADS_DIR / 'Scrappee-Browser-Import-v0.6.11.zip'
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail='Extension package not found')
-    return FileResponse(path, media_type='application/zip', filename=path.name)
-
-
-@app.get("/senders")
-def get_senders(req: Request):
-    user=current_user(req)
-    return sender_service.list_senders(uuid.UUID(user["id"]))
-
-@app.get("/senders/{sender_id}")
-def get_sender_config(sender_id: str, req: Request):
-    user=current_user(req)
-    try: sid=uuid.UUID(sender_id)
-    except ValueError: raise HTTPException(422,"Invalid sender id")
-    row=sender_service.sender_config(uuid.UUID(user["id"]),sid)
-    if not row: raise HTTPException(404,"Sender not found")
-    return row
-
-@app.post("/senders")
-def add_sender(request: SenderRequest, req: Request):
-    user=current_user(req)
-    if request.provider == 'gmail_oauth':
-        raise HTTPException(400,"Gmail senders are created only after successful Google authorization")
-    if request.provider == 'smtp':
-        raise HTTPException(400,"SMTP senders must be tested and saved together")
-    try:
-        return sender_service.create_sender(uuid.UUID(user["id"]),request.model_dump(exclude_none=True))
-    except RuntimeError as exc:
-        raise HTTPException(503,str(exc)) from exc
-    except UniqueViolation as exc:
-        raise HTTPException(409,"A sender with this email already exists. Open the existing sender and use EDIT or TEST.") from exc
-    except Exception as exc:
-        raise HTTPException(400,"Could not create sender. Check the sender details and try again.") from exc
-
-@app.post("/senders/test-and-save")
-def test_and_save_new_sender(request: SenderRequest, req: Request):
-    user=current_user(req)
-    if request.provider != 'smtp':
-        raise HTTPException(400,"This endpoint is only for SMTP senders")
-    try:
-        return sender_service.test_and_create_smtp(uuid.UUID(user["id"]),request.model_dump(exclude_none=True))
-    except UniqueViolation as exc:
-        raise HTTPException(409,"A sender with this email already exists. Open the existing sender and use EDIT or TEST.") from exc
-    except (LookupError,ValueError) as exc:
-        raise HTTPException(400,str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(502,f"SMTP connection failed: {exc}") from exc
-
-@app.patch("/senders/{sender_id}")
-def patch_sender(sender_id: str, request: SenderUpdateRequest, req: Request):
-    user=current_user(req)
-    try: sid=uuid.UUID(sender_id)
-    except ValueError: raise HTTPException(422,"Invalid sender id")
-    row=sender_service.update_sender(uuid.UUID(user["id"]),sid,request.model_dump(exclude_none=True))
-    if not row: raise HTTPException(404,"Sender not found")
-    return row
-
-@app.patch("/senders/{sender_id}/reply-to")
-def patch_sender_reply_to(sender_id: str, request: ReplyToRequest, req: Request):
-    user=current_user(req)
-    try: sid=uuid.UUID(sender_id)
-    except ValueError: raise HTTPException(422,"Invalid sender id")
-    try:
-        row=sender_service.update_reply_to(uuid.UUID(user["id"]),sid,request.reply_to)
-        if not row: raise HTTPException(404,"Sender not found")
-        return row
-    except LookupError as exc: raise HTTPException(404,str(exc)) from exc
-    except ValueError as exc: raise HTTPException(400,str(exc)) from exc
-
-@app.delete("/senders/{sender_id}",status_code=204)
-def remove_sender(sender_id: str, req: Request):
-    user=current_user(req)
-    try: sid=uuid.UUID(sender_id)
-    except ValueError: raise HTTPException(422,"Invalid sender id")
-    if not sender_service.delete_sender(uuid.UUID(user["id"]),sid): raise HTTPException(404,"Sender not found")
-
-@app.post("/senders/{sender_id}/test")
-def test_sender(sender_id: str, req: Request):
-    user=current_user(req)
-    try: sid=uuid.UUID(sender_id)
-    except ValueError: raise HTTPException(422,"Invalid sender id")
-    try: return sender_service.test_smtp(uuid.UUID(user["id"]),sid)
-    except LookupError as exc: raise HTTPException(404,str(exc))
-    except Exception as exc: raise HTTPException(502,f"Sender connection failed: {exc}") from exc
-
-@app.post("/senders/{sender_id}/test-and-save")
-def test_and_save_sender(sender_id: str, request: SenderUpdateRequest, req: Request):
-    user=current_user(req)
-    try: sid=uuid.UUID(sender_id)
-    except ValueError: raise HTTPException(422,"Invalid sender id")
-    try: return sender_service.test_and_update_smtp(uuid.UUID(user["id"]),sid,request.model_dump(exclude_none=True))
-    except LookupError as exc: raise HTTPException(404,str(exc))
-    except ValueError as exc: raise HTTPException(400,str(exc))
-    except Exception as exc: raise HTTPException(502,f"SMTP connection failed: {exc}") from exc
-
-class GmailOAuthStartRequest(BaseModel):
-    display_name: str = Field(default="Gmail",min_length=1,max_length=200)
-
-@app.post("/oauth/gmail/start")
-def start_gmail_oauth(request: GmailOAuthStartRequest, req: Request):
-    user=current_user(req)
-    try:
-        return {"authorization_url":gmail_oauth.start(uuid.UUID(user["id"]),request.display_name)}
-    except RuntimeError as exc: raise HTTPException(503,str(exc)) from exc
-
-@app.get("/oauth/gmail/callback",include_in_schema=False)
-def gmail_oauth_callback(state: str="", code: str="", error: str=""):
-    if error:
-        return RedirectResponse("https://scrapee.uk/?sender_oauth=error#sender-health")
-    try:
-        gmail_oauth.callback(state,code)
-        return RedirectResponse("https://scrapee.uk/?sender_oauth=success#sender-health")
-    except Exception:
-        return RedirectResponse("https://scrapee.uk/?sender_oauth=error#sender-health")
-
-@app.post("/senders/{sender_id}/oauth/gmail/disconnect")
-def disconnect_gmail_oauth(sender_id: str, req: Request):
-    user=current_user(req)
-    try: sid=uuid.UUID(sender_id)
-    except ValueError: raise HTTPException(422,"Invalid sender id")
-    try:
-        gmail_oauth.disconnect(uuid.UUID(user["id"]),sid)
-        return {"ok":True}
-    except LookupError as exc: raise HTTPException(404,str(exc))
-    except ValueError as exc: raise HTTPException(400,str(exc))
-
-@app.get("/letters")
-def get_letters(req: Request):
-    user=current_user(req)
-    return sender_service.list_letters(uuid.UUID(user["id"]))
-
-@app.post("/letters")
-def add_letter(request: LetterRequest, req: Request):
-    user=current_user(req)
-    return sender_service.create_letter(uuid.UUID(user["id"]),request.model_dump())
-
-@app.delete("/letters/{letter_id}",status_code=204)
-def remove_letter(letter_id: str, req: Request):
-    user=current_user(req)
-    try: lid=uuid.UUID(letter_id)
-    except ValueError: raise HTTPException(422,"Invalid letter id")
-    if not sender_service.delete_letter(uuid.UUID(user["id"]),lid): raise HTTPException(404,"Letter not found")
-
-@app.get("/campaign-audiences")
-def get_campaign_audiences(req: Request):
-    user=current_user(req)
-    return sender_service.campaign_audiences(uuid.UUID(user["id"]))
-
-@app.get("/campaign-leads")
-def get_campaign_leads(req: Request):
-    user=current_user(req)
-    return sender_service.available_leads(uuid.UUID(user["id"]))
-
-@app.get("/campaigns")
-def get_campaigns(req: Request):
-    user=current_user(req)
-    return sender_service.list_campaigns(uuid.UUID(user["id"]))
-
-@app.get("/campaigns/{campaign_id}/leads")
-def get_campaign_lead_selection(campaign_id: str, req: Request):
-    user=current_user(req)
-    try: cid=uuid.UUID(campaign_id)
-    except ValueError: raise HTTPException(422,"Invalid campaign id")
-    return sender_service.campaign_leads(uuid.UUID(user["id"]),cid)
-
-@app.post("/campaigns")
-def add_campaign(request: CampaignRequest, req: Request):
-    user=current_user(req)
-    uid=uuid.UUID(user["id"])
-    try: sid,lid=uuid.UUID(request.sender_id),uuid.UUID(request.letter_id)
-    except ValueError: raise HTTPException(422,"Invalid sender or letter id")
-    sender=sender_service.get_sender(uid,sid)
-    if not sender: raise HTTPException(404,"Sender not found")
-    with db() as conn:
-        letter=conn.execute("SELECT id FROM sender_letters WHERE id=%s AND user_id=%s",(lid,uid)).fetchone()
-    if not letter: raise HTTPException(404,"Letter not found")
-    try: return sender_service.create_campaign(uid,request.model_dump())
-    except ValueError as exc: raise HTTPException(400,str(exc)) from exc
-
-@app.post("/campaigns/{campaign_id}/send-test")
-def send_campaign_test(campaign_id: str, request: dict, req: Request):
-    user=current_user(req)
-    try: cid=uuid.UUID(campaign_id); lid=uuid.UUID(str(request.get("lead_id")))
-    except (ValueError,TypeError): raise HTTPException(422,"Invalid campaign or Lead id")
-    try: return sender_service.send_test_lead(uuid.UUID(user["id"]),cid,lid)
-    except LookupError as exc: raise HTTPException(404,str(exc)) from exc
-    except ValueError as exc: raise HTTPException(400,str(exc)) from exc
-    except Exception as exc: raise HTTPException(502,"SMTP send failed") from exc
-
-@app.get("/sending-summary")
-def get_sending_summary(req: Request):
-    user=current_user(req)
-    return sender_service.summary(uuid.UUID(user["id"]))
+        row=conn.execute("SELECT country FROM users WHERE id=%s",(uuid.UUID(user["id"]),)).fetchone()
+    return {"id":user["id"],"email":user["email"],"role":user["role"],"country":row[0] if row else None}
 
 @app.get("/settings/generic-mailbox-prefixes")
 def get_mailbox_prefixes(req: Request):
@@ -721,6 +569,19 @@ def delete_domain_rule(rule_id: str, req: Request):
         row=conn.execute("DELETE FROM domain_rules WHERE id=%s AND user_id=%s RETURNING id",(uuid.UUID(rule_id),uuid.UUID(user["id"]))).fetchone(); conn.commit()
     if not row: raise HTTPException(404,"Domain rule not found")
 
+class SearchInterpretRequest(BaseModel):
+    request: str = Field(min_length=1, max_length=5000)
+
+@app.post("/search/interpret")
+def interpret_search(request: SearchInterpretRequest, req: Request):
+    current_user(req)
+    try:
+        criteria = QueryInterpreter().interpret(request.request)
+    except Exception as exc:
+        logging.exception("Search interpretation failed")
+        raise HTTPException(422, str(exc)) from exc
+    return criteria.model_dump()
+
 @app.post("/scraps")
 def create_scrap(request: ScrapRequest, req: Request):
     user=current_user(req); scrap_id=uuid.uuid4().hex; uid=uuid.UUID(user["id"])
@@ -750,6 +611,7 @@ def create_scrap(request: ScrapRequest, req: Request):
 class WalletAdjustmentRequest(BaseModel):
     user_email: str
     amount_cents: int
+    reason: str = Field(min_length=5, max_length=500)
 
 class AdminPriceRequest(BaseModel):
     amount_cents: int = Field(ge=0)
@@ -770,8 +632,102 @@ class AdminPremiumProviderRequest(BaseModel):
 
 
 def _is_admin(user):
-    admins={x.strip().lower() for x in os.getenv("ADMIN_EMAILS","").split(",") if x.strip()}
-    return user["email"].lower() in admins
+    return user.get("role") == "admin"
+
+def _audit(conn, actor_id, action, module, target_user_id=None, metadata=None, result="success"):
+    conn.execute("INSERT INTO admin_audit_events(id,actor_id,target_user_id,action,module,result,metadata) VALUES(%s,%s,%s,%s,%s,%s,%s)",(uuid.uuid4(),uuid.UUID(str(actor_id)) if actor_id else None,uuid.UUID(str(target_user_id)) if target_user_id else None,action,module,result,Jsonb(metadata or {})))
+
+@app.get("/admin/scraps")
+def admin_scraps(req: Request, page: int = 1, page_size: int = 50, status: str = "", search: str = ""):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    page=max(1,page); page_size=max(1,min(page_size,200)); clauses=[]; params=[]
+    if status.strip(): clauses.append("s.status=%s"); params.append(status.strip())
+    if search.strip(): clauses.append("(s.name ILIKE %s OR u.email ILIKE %s)"); params.extend([f"%{search.strip()}%",f"%{search.strip()}%"])
+    where=(" WHERE "+" AND ".join(clauses)) if clauses else ""
+    with db() as conn:
+        total=int(conn.execute("SELECT COUNT(*) FROM scraps s JOIN users u ON u.id=s.user_id"+where,tuple(params)).fetchone()[0])
+        off=(page-1)*page_size
+        rows=conn.execute("SELECT s.id,s.name,s.status,s.created_at,s.completed_at,u.email,(SELECT count(*) FROM leads l WHERE l.scrap_id=s.id),(SELECT count(*) FROM serp_results sr WHERE sr.scrap_id=s.id) FROM scraps s JOIN users u ON u.id=s.user_id"+where+" ORDER BY s.created_at DESC LIMIT %s OFFSET %s",tuple(params+[page_size,off])).fetchall()
+    return {"scraps":[{"id":str(r[0]),"name":r[1],"status":r[2],"created_at":r[3].isoformat(),"completed_at":r[4].isoformat() if r[4] else None,"user_email":r[5],"leads":int(r[6]),"serp_results":int(r[7])} for r in rows],"total":total,"page":page,"page_size":page_size,"total_pages":(total+page_size-1)//page_size}
+
+@app.get("/admin/campaigns")
+def admin_campaigns(req: Request, status: str = "", search: str = ""):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    clauses=[]; params=[]
+    if status.strip(): clauses.append("c.status=%s"); params.append(status.strip())
+    if search.strip(): clauses.append("(c.name ILIKE %s OR u.email ILIKE %s)"); params.extend([f"%{search.strip()}%",f"%{search.strip()}%"])
+    where=(" WHERE "+" AND ".join(clauses)) if clauses else ""
+    with db() as conn:
+        rows=conn.execute("SELECT c.id,c.name,c.status,c.created_at,c.updated_at,u.email,sa.email,sl.name,(SELECT count(*) FROM sender_campaign_leads cl WHERE cl.campaign_id=c.id),(SELECT count(*) FROM sender_messages sm WHERE sm.campaign_id=c.id AND sm.status='sent') FROM sender_campaigns c JOIN users u ON u.id=c.user_id JOIN sender_accounts sa ON sa.id=c.sender_id JOIN sender_letters sl ON sl.id=c.letter_id"+where+" ORDER BY c.updated_at DESC LIMIT 200",tuple(params)).fetchall()
+    return [{"id":str(r[0]),"name":r[1],"status":r[2],"created_at":r[3].isoformat(),"updated_at":r[4].isoformat(),"user_email":r[5],"sender_email":r[6],"letter":r[7],"leads":int(r[8]),"sent":int(r[9])} for r in rows]
+
+@app.get("/admin/senders")
+def admin_senders(req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        rows=conn.execute("SELECT s.id,s.display_name,s.email,s.provider,s.enabled,s.health,s.created_at,s.updated_at,u.email,(SELECT count(*) FROM sender_campaigns c WHERE c.sender_id=s.id) FROM sender_accounts s JOIN users u ON u.id=s.user_id ORDER BY s.updated_at DESC LIMIT 500").fetchall()
+    return [{"id":str(r[0]),"display_name":r[1],"email":r[2],"provider":r[3],"enabled":bool(r[4]),"health":r[5],"created_at":r[6].isoformat(),"updated_at":r[7].isoformat(),"user_email":r[8],"campaigns":int(r[9])} for r in rows]
+
+@app.get("/admin/system-health")
+def admin_system_health(req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        users=int(conn.execute("SELECT count(*) FROM users").fetchone()[0])
+        active_scraps=int(conn.execute("SELECT count(*) FROM scraps WHERE status IN ('active','running')").fetchone()[0])
+        jobs=int(conn.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running','processing')").fetchone()[0])
+        extensions=int(conn.execute("SELECT count(*) FROM extension_connections WHERE last_seen_at > now()-interval '15 minutes'").fetchone()[0])
+        tickets=int(conn.execute("SELECT count(*) FROM support_tickets WHERE status NOT IN ('closed','resolved')").fetchone()[0])
+        senders=int(conn.execute("SELECT count(*) FROM sender_accounts WHERE enabled=true").fetchone()[0])
+    return {"database":"ok","users":users,"active_scraps":active_scraps,"active_jobs":jobs,"extensions_seen_15m":extensions,"open_tickets":tickets,"enabled_senders":senders}
+
+@app.get("/admin/audit-log")
+def admin_audit_log(req: Request, page: int = 1, page_size: int = 50, actor: str = "", target: str = "", module: str = "", action: str = "", result: str = ""):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    if page < 1 or page_size < 1 or page_size > 200: raise HTTPException(400,"Invalid pagination")
+    clauses=[]; params=[]
+    if actor.strip(): clauses.append("a.actor_id IN (SELECT id FROM users WHERE email ILIKE %s)"); params.append("%"+actor.strip()+"%")
+    if target.strip(): clauses.append("a.target_user_id IN (SELECT id FROM users WHERE email ILIKE %s)"); params.append("%"+target.strip()+"%")
+    if module.strip(): clauses.append("a.module=%s"); params.append(module.strip())
+    if action.strip(): clauses.append("a.action=%s"); params.append(action.strip())
+    if result.strip(): clauses.append("a.result=%s"); params.append(result.strip())
+    where=(" WHERE "+" AND ".join(clauses)) if clauses else ""
+    with db() as conn:
+        total=int(conn.execute("SELECT COUNT(*) FROM admin_audit_events a"+where,tuple(params)).fetchone()[0])
+        offset=(page-1)*page_size
+        rows=conn.execute("SELECT a.id,a.created_at,a.action,a.module,a.result,a.metadata,a.actor_id,au.email,a.target_user_id,tu.email FROM admin_audit_events a LEFT JOIN users au ON au.id=a.actor_id LEFT JOIN users tu ON tu.id=a.target_user_id"+where+" ORDER BY a.created_at DESC LIMIT %s OFFSET %s",tuple(params+[page_size,offset])).fetchall()
+    return {"events":[{"id":str(r[0]),"timestamp":r[1].isoformat(),"action":r[2],"module":r[3],"result":r[4],"metadata":r[5] or {},"actor_id":str(r[6]) if r[6] else None,"actor_email":r[7],"target_user_id":str(r[8]) if r[8] else None,"target_email":r[9]} for r in rows],"total":total,"page":page,"page_size":page_size,"total_pages":(total+page_size-1)//page_size}
+
+@app.get("/admin/domain-blacklist")
+def admin_domain_blacklist(req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        rows=conn.execute("SELECT id,domain,created_at FROM global_domain_blacklist ORDER BY domain").fetchall()
+    return [{"id":str(r[0]),"domain":r[1],"created_at":r[2].isoformat()} for r in rows]
+
+@app.post("/admin/domain-blacklist")
+def add_admin_domain_blacklist(request: DomainRuleRequest, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    from src.policy import normalize_domain
+    domain=normalize_domain(request.domain)
+    if not domain or "." not in domain: raise HTTPException(422,"Valid domain is required")
+    with db() as conn:
+        row=conn.execute("INSERT INTO global_domain_blacklist(id,domain) VALUES(%s,%s) ON CONFLICT(domain) DO UPDATE SET domain=EXCLUDED.domain RETURNING id,domain,created_at",(uuid.uuid4(),domain)).fetchone(); conn.commit()
+    return {"id":str(row[0]),"domain":row[1],"created_at":row[2].isoformat()}
+
+@app.delete("/admin/domain-blacklist/{rule_id}")
+def delete_admin_domain_blacklist(rule_id: str, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        row=conn.execute("DELETE FROM global_domain_blacklist WHERE id=%s RETURNING id",(uuid.UUID(rule_id),)).fetchone(); conn.commit()
+    if not row: raise HTTPException(404,"Blacklisted domain not found")
 
 @app.get("/admin/premium-providers")
 def admin_premium_providers(req: Request):
@@ -1041,12 +997,33 @@ def list_manual_deposits(req: Request):
     return [{"id":str(r[0]),"method":r[1],"amount_cents":int(r[2]),"reference":r[3],"sender_name":r[4],"notes":r[5],"status":r[6],"reviewed_at":r[7].isoformat() if r[7] else None,"created_at":r[8].isoformat()} for r in rows]
 
 @app.get("/admin/deposits")
-def admin_deposits(req: Request):
+def admin_deposits(req: Request, status: str = "pending", page: int = 1, page_size: int = 10, search: str = ""):
     user=current_user(req)
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    if status not in {"pending","settled","failed","all"}: raise HTTPException(422,"Invalid deposit status")
+    page=max(1,page); page_size=max(10,min(page_size,100)); search=search.strip()
+    status_clause={
+        "pending":"status IN ('pending','processing')",
+        "settled":"status IN ('approved','settled')",
+        "failed":"status IN ('rejected','expired','invalid')",
+        "all":"TRUE"
+    }[status]
+    search_clause=""
+    args=[]
+    if search:
+        search_clause=" AND (email ILIKE %s OR reference ILIKE %s OR COALESCE(sender_name,'') ILIKE %s OR method ILIKE %s)"
+        args=[f"%{search}%"]*4
     with db() as conn:
-        rows=conn.execute("SELECT d.id,u.email,d.method,d.amount_cents,d.reference,d.sender_name,d.notes,d.status,d.created_at FROM manual_deposits d JOIN users u ON u.id=d.user_id WHERE d.status='pending' ORDER BY d.created_at ASC").fetchall()
-    return [{"id":str(r[0]),"email":r[1],"method":r[2],"amount_cents":int(r[3]),"reference":r[4],"sender_name":r[5],"notes":r[6],"status":r[7],"created_at":r[8].isoformat()} for r in rows]
+        base=f"""SELECT * FROM (
+            SELECT d.id,u.email,d.method,d.amount_cents,d.reference,d.sender_name,d.notes,d.status,d.created_at,'manual' AS source,TRUE AS reviewable
+            FROM manual_deposits d JOIN users u ON u.id=d.user_id
+            UNION ALL
+            SELECT d.id,u.email,'BTCPay / ' || d.asset,d.requested_cents,d.btcpay_invoice_id,NULL,NULL,d.status,d.created_at,'btcpay' AS source,FALSE AS reviewable
+            FROM wallet_deposits d JOIN users u ON u.id=d.user_id
+        ) deposits WHERE {status_clause}{search_clause}"""
+        total=int(conn.execute(f"SELECT count(*) FROM ({base}) q",tuple(args)).fetchone()[0])
+        rows=conn.execute(f"SELECT id,email,method,amount_cents,reference,sender_name,notes,status,created_at,source,reviewable FROM ({base}) q ORDER BY created_at DESC LIMIT %s OFFSET %s",tuple(args+[page_size,(page-1)*page_size])).fetchall()
+    return {"deposits":[{"id":str(r[0]),"email":r[1],"method":r[2],"amount_cents":int(r[3]),"reference":r[4],"sender_name":r[5],"notes":r[6],"status":r[7],"created_at":r[8].isoformat(),"source":r[9],"reviewable":bool(r[10])} for r in rows],"pagination":{"page":page,"page_size":page_size,"total":total,"total_pages":(total+page_size-1)//page_size}}
 
 @app.post("/admin/deposits/{deposit_id}/review")
 def review_manual_deposit(deposit_id: str, request: ManualDepositReviewRequest, req: Request):
@@ -1064,6 +1041,7 @@ def review_manual_deposit(deposit_id: str, request: ManualDepositReviewRequest, 
             conn.execute("UPDATE wallets SET balance_cents=%s,updated_at=now() WHERE user_id=%s",(new_balance,uid))
             conn.execute("INSERT INTO wallet_transactions(id,user_id,amount_cents,balance_after_cents,transaction_type,reference_id) VALUES(gen_random_uuid(),%s,%s,%s,'manual_deposit',%s) ON CONFLICT(user_id,transaction_type,reference_id) DO NOTHING",(uid,amount_cents,new_balance,deposit_id))
         conn.execute("UPDATE manual_deposits SET status=%s,reviewed_by=%s,reviewed_at=now() WHERE id=%s",('approved' if request.approved else 'rejected',uuid.UUID(user['id']),uuid.UUID(deposit_id)))
+        _audit(conn,user['id'],"deposit_"+('approved' if request.approved else 'rejected'),"billing",uid,{"deposit_id":deposit_id,"amount_cents":int(amount_cents)})
         conn.commit()
     return {"id":deposit_id,"status":"approved" if request.approved else "rejected"}
 
@@ -1075,6 +1053,7 @@ def save_deposit_config(request: AdminDepositConfigRequest, req: Request):
         values=(('usdt_manual_enabled',request.usdt_manual_enabled),('usdt_manual_wallet',request.usdt_manual_wallet),('bank_transfer_details',request.bank_transfer_details),('btcpay_ltc_store_id',request.btcpay_ltc_store_id),('btcpay_usdt_store_id',request.btcpay_usdt_store_id))
         for key,value in values:
             conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES(%s,%s,now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(key,Jsonb(value)))
+        _audit(conn,user['id'],"deposit_config_updated","billing",None,{"usdt_manual_enabled":request.usdt_manual_enabled,"btcpay_ltc_configured":bool(request.btcpay_ltc_store_id),"btcpay_usdt_configured":bool(request.btcpay_usdt_store_id)})
         conn.commit()
     return {"saved":True}
 
@@ -1091,7 +1070,7 @@ def set_scrap_price(amount_cents: int, req: Request):
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
     if amount_cents < 0: raise HTTPException(422,"Price cannot be negative")
     with db() as conn:
-        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('scrap_creation_price_cents',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(amount_cents,)); conn.commit()
+        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('scrap_creation_price_cents',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(amount_cents,)); _audit(conn,user['id'],"scrap_price_updated","configuration",None,{"amount_cents":amount_cents}); conn.commit()
     return {"scrap_creation_price_cents":amount_cents}
 
 @app.post("/admin/paid-enrichment-price")
@@ -1100,7 +1079,7 @@ def admin_paid_enrichment_price(request: AdminPaidEnrichmentPriceRequest, req: R
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
     unit_micros = request.unit_micros_usd
     with db() as conn:
-        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('paid_enrichment_unit_micros_usd',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(unit_micros,)); conn.commit()
+        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('paid_enrichment_unit_micros_usd',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(unit_micros,)); _audit(conn,user['id'],"paid_enrichment_price_updated","configuration",None,{"unit_micros_usd":unit_micros}); conn.commit()
     return {"paid_enrichment_unit_micros_usd":unit_micros}
 
 @app.post("/admin/premium-serp-price")
@@ -1109,7 +1088,7 @@ def admin_premium_serp_price(request: AdminPriceRequest, req: Request):
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
     amount_cents=request.amount_cents
     with db() as conn:
-        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('premium_serp_price_cents',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(amount_cents,)); conn.commit()
+        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('premium_serp_price_cents',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(amount_cents,)); _audit(conn,user['id'],"premium_serp_price_updated","configuration",None,{"amount_cents":amount_cents}); conn.commit()
     return {"premium_serp_price_cents":amount_cents}
 
 @app.post("/admin/page-indexer-price")
@@ -1118,7 +1097,7 @@ def admin_page_indexer_price(request: AdminPriceRequest, req: Request):
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
     if request.amount_cents < 0: raise HTTPException(422,"Price cannot be negative")
     with db() as conn:
-        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('page_indexer_price_cents',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(request.amount_cents,)); conn.commit()
+        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('page_indexer_price_cents',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(request.amount_cents,)); _audit(conn,user['id'],"page_indexer_price_updated","configuration",None,{"amount_cents":request.amount_cents}); conn.commit()
     return {"page_indexer_price_cents":request.amount_cents}
 
 
@@ -1130,7 +1109,7 @@ def admin_serp_limit(request: dict, req: Request):
     except (TypeError,ValueError): raise HTTPException(400,"limit must be an integer")
     if limit < 1 or limit > 1000000: raise HTTPException(400,"limit must be between 1 and 1000000")
     with db() as conn:
-        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('serp_result_limit',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(limit,)); conn.commit()
+        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('serp_result_limit',to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(limit,)); _audit(conn,user['id'],"serp_limit_updated","configuration",None,{"limit":limit}); conn.commit()
     return {"serp_result_limit":limit}
 
 @app.get("/admin/users")
@@ -1138,8 +1117,8 @@ def admin_users(req: Request):
     user=current_user(req)
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
     with db() as conn:
-        rows=conn.execute("SELECT u.id,u.email,u.created_at,COALESCE(w.balance_cents,0) FROM users u LEFT JOIN wallets w ON w.user_id=u.id ORDER BY u.created_at DESC,u.email").fetchall()
-    return [{"id":str(r[0]),"email":r[1],"created_at":r[2].isoformat(),"balance_cents":int(r[3])} for r in rows]
+        rows=conn.execute("SELECT u.id,u.email,u.role,u.country,u.created_at,u.last_login_at,COALESCE(w.balance_cents,0) FROM users u LEFT JOIN wallets w ON w.user_id=u.id ORDER BY u.created_at DESC,u.email").fetchall()
+    return [{"id":str(r[0]),"email":r[1],"role":r[2],"country":r[3],"created_at":r[4].isoformat(),"last_login_at":r[5].isoformat() if r[5] else None,"balance_cents":int(r[6])} for r in rows]
 
 @app.get("/admin/users/paged")
 def admin_users_paged(req: Request, page: int = 1, page_size: int = 50, search: str = ""):
@@ -1152,8 +1131,30 @@ def admin_users_paged(req: Request, page: int = 1, page_size: int = 50, search: 
     with db() as conn:
         total=int(conn.execute("SELECT COUNT(*) FROM users WHERE email ILIKE %s",(pattern,)).fetchone()[0])
         offset=(page-1)*page_size
-        rows=conn.execute("SELECT u.id,u.email,u.created_at,COALESCE(w.balance_cents,0) FROM users u LEFT JOIN wallets w ON w.user_id=u.id WHERE u.email ILIKE %s ORDER BY u.created_at DESC,u.email LIMIT %s OFFSET %s",(pattern,page_size,offset)).fetchall()
-    return {"users":[{"id":str(r[0]),"email":r[1],"created_at":r[2].isoformat(),"balance_cents":int(r[3])} for r in rows],"total":total,"page":page,"page_size":page_size,"total_pages":(total+page_size-1)//page_size}
+        rows=conn.execute("SELECT u.id,u.email,u.role,u.country,u.created_at,u.last_login_at,COALESCE(w.balance_cents,0) FROM users u LEFT JOIN wallets w ON w.user_id=u.id WHERE u.email ILIKE %s ORDER BY u.created_at DESC,u.email LIMIT %s OFFSET %s",(pattern,page_size,offset)).fetchall()
+    return {"users":[{"id":str(r[0]),"email":r[1],"role":r[2],"country":r[3],"created_at":r[4].isoformat(),"last_login_at":r[5].isoformat() if r[5] else None,"balance_cents":int(r[6])} for r in rows],"total":total,"page":page,"page_size":page_size,"total_pages":(total+page_size-1)//page_size}
+
+@app.patch("/admin/users/{user_id}/role")
+async def admin_change_user_role(user_id: str, req: Request):
+    admin=current_user(req)
+    if not _is_admin(admin): raise HTTPException(403,"Admin access required")
+    try: uid=uuid.UUID(user_id)
+    except ValueError as exc: raise HTTPException(422,"Invalid user id") from exc
+    body=await req.json()
+    role=body.get("role")
+    if role not in {"user","admin"}: raise HTTPException(422,"Role must be user or admin")
+    if uid == uuid.UUID(admin["id"]) and role != "admin": raise HTTPException(409,"You cannot remove your own admin role")
+    with db() as conn:
+        row=conn.execute("SELECT email,role FROM users WHERE id=%s",(uid,)).fetchone()
+        if not row: raise HTTPException(404,"User not found")
+        if row[1]==role: return {"updated":False,"role":role}
+        if role=="user":
+            admins=int(conn.execute("SELECT count(*) FROM users WHERE role='admin'").fetchone()[0])
+            if admins<=1: raise HTTPException(409,"At least one admin account must remain")
+        conn.execute("UPDATE users SET role=%s WHERE id=%s",(role,uid))
+        _audit(conn,admin["id"],"user_role_changed","users",str(uid),{"target_email":row[0],"from_role":row[1],"to_role":role})
+        conn.commit()
+    return {"updated":True,"role":role}
 
 @app.post("/admin/users/bulk-delete")
 def admin_bulk_delete_users(request: AdminBulkDeleteUsersRequest, req: Request):
@@ -1167,8 +1168,52 @@ def admin_bulk_delete_users(request: AdminBulkDeleteUsersRequest, req: Request):
     placeholders=",".join(["%s"]*len(ids))
     with db() as conn:
         rows=conn.execute(f"DELETE FROM users WHERE id IN ({placeholders}) RETURNING email",tuple(ids)).fetchall()
+        _audit(conn,user['id'],"users_bulk_deleted","users",None,{"requested":len(ids),"deleted":len(rows),"emails":[r[0] for r in rows]})
         conn.commit()
     return {"deleted":len(rows),"emails":[r[0] for r in rows],"requested":len(ids)}
+
+@app.get("/admin/users/{user_id}")
+def admin_user_detail(user_id: str, req: Request, wallet_page: int = 1, wallet_page_size: int = 10):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    try: uid=uuid.UUID(user_id)
+    except ValueError as exc: raise HTTPException(422,"Invalid user id") from exc
+    wallet_page=max(1,wallet_page); wallet_page_size=max(5,min(wallet_page_size,50))
+    with db() as conn:
+        row=conn.execute("SELECT u.id,u.email,u.created_at,COALESCE(w.balance_cents,0) FROM users u LEFT JOIN wallets w ON w.user_id=u.id WHERE u.id=%s",(uid,)).fetchone()
+        if not row: raise HTTPException(404,"User not found")
+        wallet_total=int(conn.execute("SELECT count(*) FROM wallet_transactions WHERE user_id=%s",(uid,)).fetchone()[0])
+        wallet_offset=(wallet_page-1)*wallet_page_size
+        tx=conn.execute("SELECT id,amount_cents,balance_after_cents,transaction_type,reference_id,created_at FROM wallet_transactions WHERE user_id=%s ORDER BY created_at DESC LIMIT %s OFFSET %s",(uid,wallet_page_size,wallet_offset)).fetchall()
+        scraps=conn.execute("SELECT count(*),count(*) FILTER (WHERE status IN ('active','running')),count(*) FILTER (WHERE status IN ('completed','complete')) FROM scraps WHERE user_id=%s",(uid,)).fetchone()
+    return {"user":{"id":str(row[0]),"email":row[1],"created_at":row[2].isoformat(),"balance_cents":int(row[3])},"wallet_transactions":[{"id":str(r[0]),"amount_cents":int(r[1]),"balance_after_cents":int(r[2]),"transaction_type":r[3],"reference_id":r[4],"created_at":r[5].isoformat()} for r in tx],"wallet_pagination":{"page":wallet_page,"page_size":wallet_page_size,"total":wallet_total,"total_pages":(wallet_total+wallet_page_size-1)//wallet_page_size},"scraps":{"total":int(scraps[0]),"active":int(scraps[1]),"completed":int(scraps[2])}}
+
+@app.get("/admin/users/{user_id}/activity")
+def admin_user_activity(user_id: str, req: Request, page: int = 1, page_size: int = 20):
+    admin=current_user(req)
+    if not _is_admin(admin): raise HTTPException(403,"Admin access required")
+    try: uid=uuid.UUID(user_id)
+    except ValueError as exc: raise HTTPException(422,"Invalid user id") from exc
+    page=max(1,page)
+    page_size=max(10,min(page_size,100))
+    limit=200
+    events=[]
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM users WHERE id=%s",(uid,)).fetchone(): raise HTTPException(404,"User not found")
+        rows=conn.execute("SELECT created_at,'wallet'::text,'wallet'::text,transaction_type,amount_cents,reference_id FROM wallet_transactions WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",(uid,limit)).fetchall()
+        events += [{"timestamp":r[0].isoformat(),"source":"wallet","action":r[3],"module":r[2],"result":"success","metadata":{"amount_cents":int(r[4]),"reference_id":r[5]}} for r in rows]
+        rows=conn.execute("SELECT created_at,status,name,id FROM scraps WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",(uid,limit)).fetchall()
+        events += [{"timestamp":r[0].isoformat(),"source":"scrap","action":"scrap_"+str(r[1]),"module":"research","result":"success","metadata":{"name":r[2],"scrap_id":str(r[3])}} for r in rows]
+        rows=conn.execute("SELECT a.created_at,a.action,a.metadata,u.email FROM support_audit_events a JOIN support_tickets t ON t.id=a.ticket_id LEFT JOIN users u ON u.id=a.actor_id WHERE t.user_id=%s ORDER BY a.created_at DESC LIMIT %s",(uid,limit)).fetchall()
+        events += [{"timestamp":r[0].isoformat(),"source":"support","action":r[1],"module":"support","result":"success","metadata":{**(r[2] or {}),"actor_email":r[3]}} for r in rows]
+        rows=conn.execute("SELECT created_at,action,module,result,metadata,actor_id FROM admin_audit_events WHERE target_user_id=%s ORDER BY created_at DESC LIMIT %s",(uid,limit)).fetchall()
+        events += [{"timestamp":r[0].isoformat(),"source":"admin","action":r[1],"module":r[2],"result":r[3],"metadata":{**(r[4] or {}),"actor_id":str(r[5]) if r[5] else None}} for r in rows]
+        rows=conn.execute("SELECT created_at,expires_at,persistent FROM sessions WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",(uid,limit)).fetchall()
+        events += [{"timestamp":r[0].isoformat(),"source":"auth","action":"session_created","module":"authentication","result":"success","metadata":{"persistent":bool(r[2]),"expires_at":r[1].isoformat()}} for r in rows]
+    events.sort(key=lambda x:x["timestamp"],reverse=True)
+    total=len(events)
+    start=(page-1)*page_size
+    return {"events":events[start:start+page_size],"pagination":{"page":page,"page_size":page_size,"total":total,"total_pages":(total+page_size-1)//page_size}}
 
 @app.delete("/admin/users/{user_id}")
 def admin_delete_user(user_id: str, req: Request):
@@ -1178,8 +1223,10 @@ def admin_delete_user(user_id: str, req: Request):
     except ValueError as exc: raise HTTPException(422,"Invalid user id") from exc
     if uid == uuid.UUID(user["id"]): raise HTTPException(409,"The logged-in admin cannot delete itself")
     with db() as conn:
-        row=conn.execute("DELETE FROM users WHERE id=%s RETURNING email",(uid,)).fetchone()
+        row=conn.execute("SELECT email FROM users WHERE id=%s",(uid,)).fetchone()
         if not row: raise HTTPException(404,"User not found")
+        _audit(conn,user["id"],"user_deleted","users",None,{"target_user_id":str(uid),"target_email":row[0]})
+        conn.execute("DELETE FROM users WHERE id=%s",(uid,))
         conn.commit()
     return {"deleted":True,"email":row[0]}
 
@@ -1188,7 +1235,7 @@ def admin_settings(req: Request):
     user=current_user(req)
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
     with db() as conn:
-        rows=conn.execute("SELECT key,value FROM app_settings WHERE key IN ('scrap_creation_price_cents','premium_serp_price_cents','paid_enrichment_unit_micros_usd','serp_result_limit','research_default_max_leads','research_max_leads','research_timeout_hours')").fetchall()
+        rows=conn.execute("SELECT key,value FROM app_settings WHERE key IN ('scrap_creation_price_cents','premium_serp_price_cents','paid_enrichment_unit_micros_usd','page_indexer_price_cents','serp_result_limit','research_default_max_leads','research_max_leads','research_timeout_hours')").fetchall()
     values={r[0]:int(r[1]) for r in rows}
     return values
 
@@ -1200,16 +1247,21 @@ def admin_research_settings(request: AdminResearchSettingsRequest, req: Request)
     with db() as conn:
         for key,value in (("research_default_max_leads",request.default_max_leads),("research_max_leads",request.max_leads),("research_timeout_hours",request.timeout_hours)):
             conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES(%s,to_jsonb(%s::bigint),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(key,value))
+        _audit(conn,user['id'],"research_settings_updated","configuration",None,{"default_max_leads":request.default_max_leads,"max_leads":request.max_leads,"timeout_hours":request.timeout_hours})
         conn.commit()
     return {"default_max_leads":request.default_max_leads,"max_leads":request.max_leads,"timeout_hours":request.timeout_hours}
 
 @app.get("/admin/wallets")
-def admin_wallets(req: Request):
+def admin_wallets(req: Request, page: int = 1, page_size: int = 25, search: str = ""):
     user=current_user(req)
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    page=max(1,page); page_size=max(10,min(page_size,100)); search=search.strip()
     with db() as conn:
-        rows=conn.execute("SELECT u.email,w.balance_cents FROM users u JOIN wallets w ON w.user_id=u.id ORDER BY u.email").fetchall()
-    return [{"email":r[0],"balance_cents":int(r[1])} for r in rows]
+        where="WHERE u.email ILIKE %s" if search else ""
+        args=(f"%{search}%",) if search else ()
+        total=int(conn.execute(f"SELECT count(*) FROM users u JOIN wallets w ON w.user_id=u.id {where}",args).fetchone()[0])
+        rows=conn.execute(f"SELECT u.id,u.email,w.balance_cents FROM users u JOIN wallets w ON w.user_id=u.id {where} ORDER BY u.email LIMIT %s OFFSET %s",args+(page_size,(page-1)*page_size)).fetchall()
+    return {"wallets":[{"id":str(r[0]),"email":r[1],"balance_cents":int(r[2])} for r in rows],"pagination":{"page":page,"page_size":page_size,"total":total,"total_pages":(total+page_size-1)//page_size}}
 
 @app.post("/admin/wallet-adjust")
 def adjust_wallet(request: WalletAdjustmentRequest, req: Request):
@@ -1224,6 +1276,7 @@ def adjust_wallet(request: WalletAdjustmentRequest, req: Request):
         if new_balance < 0: raise HTTPException(422,"Wallet balance cannot become negative")
         conn.execute("UPDATE wallets SET balance_cents=%s,updated_at=now() WHERE user_id=%s",(new_balance,uid))
         conn.execute("INSERT INTO wallet_transactions(id,user_id,amount_cents,balance_after_cents,transaction_type) VALUES(%s,%s,%s,%s,'admin_adjustment')",(uuid.uuid4(),uid,request.amount_cents,new_balance))
+        _audit(conn,user["id"],"wallet_adjustment","billing",uid,{"amount_cents":request.amount_cents,"balance_after_cents":new_balance,"reason":request.reason})
         conn.commit()
     return {"balance_cents":new_balance}
 
@@ -1232,8 +1285,11 @@ def current_scrap(req: Request):
     user=current_user(req)
     with db() as conn:
         row=conn.execute("SELECT id,name,status,criteria,crawler_config FROM scraps WHERE user_id=%s AND status IN ('active','running') ORDER BY created_at DESC LIMIT 1",(uuid.UUID(user["id"]),)).fetchone()
-    if not row: return None
-    return {"id":str(row[0]),"name":row[1],"status":row[2],"criteria":row[3],"crawler":row[4]}
+        if not row: return None
+        sid=uuid.UUID(str(row[0]))
+        counts=conn.execute("SELECT (SELECT count(*) FROM serp_results WHERE scrap_id=%s),(SELECT count(*) FROM url_occurrences WHERE scrap_id=%s),(SELECT count(*) FROM leads WHERE scrap_id=%s),(SELECT count(DISTINCT l.id) FROM leads l JOIN lead_sources ls ON ls.lead_id=l.id JOIN evidence e ON e.id=ls.evidence_id WHERE l.scrap_id=%s AND e.source_type='page_indexer' AND NULLIF(trim(l.data->>'email'),'') IS NOT NULL)",(sid,sid,sid,sid)).fetchone()
+        serp_limit=_serp_limit(conn)
+    return {"id":str(row[0]),"name":row[1],"status":row[2],"criteria":row[3],"crawler":row[4],"counts":{"serp_results":int(counts[0]),"url_occurrences":int(counts[1]),"leads":int(counts[2]),"email_indexed":int(counts[3])},"serp_limit":serp_limit}
 
 @app.post("/scraps/{scrap_id}/complete-submission")
 def complete_submission(scrap_id: str, req: Request):
@@ -1305,9 +1361,22 @@ def lead_workstation(scrap_id: str, req: Request):
             "SELECT id,data,status,approved_at,approved_by,created_at FROM leads WHERE scrap_id=%s ORDER BY created_at,id",
             (sid,),
         ).fetchall()
+        source_rows = conn.execute(
+            "SELECT ls.lead_id,e.id,e.source_type,e.data,e.created_at "
+            "FROM lead_sources ls JOIN evidence e ON e.id=ls.evidence_id "
+            "WHERE ls.lead_id = ANY(%s) ORDER BY e.created_at DESC",
+            ([row[0] for row in rows],),
+        ).fetchall() if rows else []
+    sources_by_lead = {}
+    for row in source_rows:
+        sources_by_lead.setdefault(str(row[0]), []).append({
+            "id": str(row[1]), "source_type": row[2], "data": row[3],
+            "created_at": row[4].isoformat(),
+        })
     leads = [
         {"id": str(row[0]), "data": row[1], "status": row[2], "approved_at": row[3].isoformat() if row[3] else None,
-         "approved_by": str(row[4]) if row[4] else None, "created_at": row[5].isoformat()}
+         "approved_by": str(row[4]) if row[4] else None, "created_at": row[5].isoformat(),
+         "sources": sources_by_lead.get(str(row[0]), [])}
         for row in rows
     ]
     return {
@@ -1846,6 +1915,24 @@ def download_export(scrap_id: str, export_id: str, req: Request):
     if not output.exists(): raise HTTPException(404,"Export file not found")
     media='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' if row[0]=='xlsx' else 'text/csv'
     return FileResponse(output,media_type=media,filename=f"scrappee-{sid}.{row[0]}")
+
+
+@app.post("/scraps/{scrap_id}/exports/generate/{fmt}")
+def generate_scrap_export(scrap_id: str, fmt: str, req: Request):
+    user=current_user(req); sid=uuid.UUID(scrap_id)
+    if fmt not in ("csv", "xlsx"):
+        raise HTTPException(400, "Export format must be csv or xlsx")
+    with db() as conn:
+        owned=conn.execute("SELECT 1 FROM scraps WHERE id=%s AND user_id=%s", (sid, uuid.UUID(user["id"]))).fetchone()
+        if not owned: raise HTTPException(404, "Scrap not found")
+        rows=conn.execute("SELECT data FROM leads WHERE scrap_id=%s ORDER BY created_at,id", (sid,)).fetchall()
+    leads=[Lead.model_construct(**(row[0] or {})) for row in rows]
+    export_id=uuid.uuid4()
+    output=_write_export(leads, export_id.hex, fmt)
+    with db() as conn:
+        conn.execute("INSERT INTO exports(id,scrap_id,format,location) VALUES(%s,%s,%s,%s)", (export_id,sid,fmt,output))
+        conn.commit()
+    return {"id":str(export_id),"scrap_id":scrap_id,"format":fmt,"location":output,"lead_count":len(leads),"download_url":f"/scraps/{scrap_id}/exports/{export_id}/download"}
 
 
 @app.post("/search/parameters")

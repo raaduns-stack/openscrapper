@@ -353,9 +353,16 @@ def send_test_lead(user_id, campaign_id, lead_id):
             FROM sender_campaigns c
             JOIN sender_accounts s ON s.id=c.sender_id
             JOIN sender_letters le ON le.id=c.letter_id
-            JOIN sender_campaign_leads cl ON cl.campaign_id=c.id AND cl.user_id=c.user_id AND cl.lead_id=%s
-            JOIN leads l ON l.id=cl.lead_id
+            JOIN leads l ON l.id=%s AND l.status='completed'
+            JOIN scraps ls ON ls.id=l.scrap_id AND ls.user_id=c.user_id
             WHERE c.id=%s AND c.user_id=%s
+              AND (
+                EXISTS (SELECT 1 FROM sender_campaign_leads cl WHERE cl.campaign_id=c.id AND cl.user_id=c.user_id AND cl.lead_id=l.id)
+                OR (
+                  (c.config->'audience'->>'type')='lead_group'
+                  AND l.scrap_id=((c.config->'audience'->>'scrap_id')::uuid)
+                )
+              )
         """,(lead_id,campaign_id,user_id)).fetchone()
         if not row: raise LookupError("Campaign or selected Lead not found")
         if row[1] != 'draft': raise ValueError("Only draft campaigns can send a test message")

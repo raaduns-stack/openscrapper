@@ -50,7 +50,16 @@ class SearchTemplateEngine:
         ).fetchall()
         values = self._values(criteria)
         params=[]; seen=set()
+        providers=[p for p in ("google","bing") if any(r[2]==p for r in rows)]
+        if max_queries is not None and providers:
+            provider_limits={p:max_queries//len(providers) for p in providers}
+            for p in providers[:max_queries % len(providers)]: provider_limits[p]+=1
+        else:
+            provider_limits={p:max_queries for p in providers}
+        provider_counts={p:0 for p in providers}
         for tid,cid,provider,template,family,category in rows:
+            if max_queries is not None and provider_counts.get(provider,0) >= provider_limits.get(provider,0):
+                continue
             variables=VAR_RE.findall(template)
             if any(v not in VARIABLES for v in variables):
                 continue
@@ -64,6 +73,8 @@ class SearchTemplateEngine:
             for resolved in combos:
                 if max_queries is not None and len(params) >= max_queries:
                     return params
+                if max_queries is not None and provider_counts.get(provider,0) >= provider_limits.get(provider,0):
+                    continue
                 query=" ".join(template.format(**resolved).split()).strip()
                 key=(provider,query.casefold())
                 if not query or key in seen:
@@ -74,4 +85,5 @@ class SearchTemplateEngine:
                 seen.add(key)
                 ident=f"{provider}-{len(params)+1}"
                 params.append(TemplateParameter(ident,provider,query,adapter.build_url(query),family,category,str(tid),resolved))
+                provider_counts[provider]=provider_counts.get(provider,0)+1
         return params
