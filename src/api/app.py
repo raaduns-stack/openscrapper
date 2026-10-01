@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
-import asyncio, secrets, time, uuid, os, math, logging, re, subprocess, smtplib, ssl, base64
+import asyncio, secrets, time, uuid, os, math, logging, re, subprocess, smtplib, ssl, base64, threading
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
@@ -26,7 +26,7 @@ from src.search.template_engine import SearchTemplateEngine, VARIABLES
 from src.search.premium import HttpPremiumSerpProvider, parse_search_url, SUPPORTED_PROVIDERS, provider_statuses, save_provider_config
 from src.db import db, init_db, purge_expired_history, get_client_policies
 from src.auth import create_user, login_user, current_user, create_session, request_password_reset, reset_password
-from src.payments_btcpay import configured as btcpay_configured, create_invoice as btcpay_create_invoice, verify_webhook as btcpay_verify_webhook, payment_btc as btcpay_payment_btc
+from src.payments_btcpay import configured as btcpay_configured, create_invoice as btcpay_create_invoice, get_invoice as btcpay_get_invoice, verify_webhook as btcpay_verify_webhook, payment_btc as btcpay_payment_btc
 import hashlib
 from psycopg.types.json import Jsonb
 from psycopg.errors import UniqueViolation
@@ -476,6 +476,36 @@ If you did not request this, you can safely ignore this email.
         smtp.login(smtp_user,smtp_password)
         smtp.sendmail(from_address,[email],msg)
 
+def _send_wallet_adjustment_email(email, amount_cents, reason, new_balance_cents):
+    from_address=os.getenv("SCRAPPEE_MAIL_FROM","Scrappee <noreply@scrapee.uk>")
+    amount=float(amount_cents)/100
+    new_balance=float(new_balance_cents)/100
+    subject="Your Scrappee wallet has been credited" if amount_cents >= 0 else "Your Scrappee wallet has been debited"
+    action="credited" if amount_cents >= 0 else "debited"
+    msg=f"""From: {from_address}
+To: {email}
+Subject: {subject}
+Content-Type: text/plain; charset=UTF-8
+
+Your Scrappee wallet has been {action}.
+
+Amount: ${amount:,.2f}
+Remark: {reason}
+New wallet balance: ${new_balance:,.2f}
+
+This is an automated notification from Scrappee.
+"""
+    smtp_host=os.getenv("SCRAPPEE_SMTP_HOST","")
+    smtp_port=int(os.getenv("SCRAPPEE_SMTP_PORT","465"))
+    smtp_user=os.getenv("SCRAPPEE_SMTP_USER","")
+    smtp_password=os.getenv("SCRAPPEE_SMTP_PASSWORD","") or base64.b64decode(os.getenv("SCRAPPEE_SMTP_PASSWORD_B64","")).decode()
+    if not smtp_host or not smtp_user or not smtp_password:
+        raise RuntimeError("SMTP wallet notification delivery is not configured")
+    context=ssl.create_default_context()
+    with smtplib.SMTP_SSL(smtp_host,smtp_port,context=context,timeout=15) as smtp:
+        smtp.login(smtp_user,smtp_password)
+        smtp.sendmail(from_address,[email],msg)
+
 @app.post("/auth/forgot-password")
 def forgot_password(payload: PasswordResetRequest, background_tasks: BackgroundTasks):
     normalized=payload.email.lower().strip()
@@ -520,6 +550,61 @@ def me(request: Request):
     with db() as conn:
         row=conn.execute("SELECT country FROM users WHERE id=%s",(uuid.UUID(user["id"]),)).fetchone()
     return {"id":user["id"],"email":user["email"],"role":user["role"],"country":row[0] if row else None}
+
+LATEST_EXTENSION_PACKAGE_RE = re.compile(r"^Scrappee-Browser-Import-v(\d+)\.(\d+)\.(\d+)\.zip$")
+
+def _latest_extension_package():
+    packages=[]
+    for path in DOWNLOADS_DIR.glob("Scrappee-Browser-Import-v*.zip"):
+        match=LATEST_EXTENSION_PACKAGE_RE.match(path.name)
+        if match:
+            packages.append(((int(match.group(1)),int(match.group(2)),int(match.group(3))),path))
+    if not packages:
+        raise HTTPException(404,"Extension package not found")
+    return max(packages,key=lambda item:item[0])
+
+class ExtensionHeartbeatRequest(BaseModel):
+    version: str = Field(min_length=1, max_length=32)
+
+@app.post("/extension/heartbeat")
+def extension_heartbeat(request: ExtensionHeartbeatRequest, req: Request):
+    user=current_user(req)
+    if req.headers.get("X-Scrappee-Extension") != "1":
+        raise HTTPException(403,"Extension client required")
+    with db() as conn:
+        conn.execute("""INSERT INTO extension_connections(user_id,version,last_seen_at,updated_at)
+            VALUES(%s,%s,now(),now())
+            ON CONFLICT(user_id) DO UPDATE SET version=EXCLUDED.version,last_seen_at=now(),updated_at=now()""",
+            (uuid.UUID(user["id"]),request.version))
+        conn.commit()
+    version,_ = _latest_extension_package()
+    latest_version = ".".join(map(str,version))
+    return {"ok":True,"version":request.version,"latest_version":latest_version}
+
+@app.get("/extension/status")
+def extension_status(req: Request):
+    user=current_user(req)
+    version,_ = _latest_extension_package()
+    latest_version = ".".join(map(str,version))
+    with db() as conn:
+        row=conn.execute("SELECT version,last_seen_at FROM extension_connections WHERE user_id=%s",(uuid.UUID(user["id"]),)).fetchone()
+    if not row:
+        return {"connected":False,"version":None,"latest_version":latest_version,"last_seen_at":None,"outdated":False}
+    installed_version,last_seen=row
+    connected=(time.time()-last_seen.timestamp()) <= 120
+    return {"connected":connected,"version":installed_version,"latest_version":latest_version,"last_seen_at":last_seen.isoformat(),"outdated":connected and installed_version != latest_version}
+
+@app.get("/downloads/latest", include_in_schema=False)
+def download_extension_latest():
+    _,path=_latest_extension_package()
+    return FileResponse(path,media_type="application/zip",filename=path.name)
+
+@app.get("/downloads/scrappee-browser-import-v0.6.13.zip", include_in_schema=False)
+def download_extension_v0613():
+    path=DOWNLOADS_DIR / "Scrappee-Browser-Import-v0.6.13.zip"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Extension package not found")
+    return FileResponse(path,media_type="application/zip",filename=path.name)
 
 @app.get("/settings/generic-mailbox-prefixes")
 def get_mailbox_prefixes(req: Request):
@@ -865,6 +950,15 @@ def billing(req: Request):
 class BtcPayDepositRequest(BaseModel):
     amount_cents: int = Field(ge=MIN_DEPOSIT_CENTS, le=100000000)
     asset: Literal['BTC', 'LTC', 'USDT'] = 'BTC'
+    network: Literal['TRON', 'BSC'] | None = None
+
+    @model_validator(mode='after')
+    def validate_network(self):
+        if self.asset == 'USDT' and self.network not in {'TRON','BSC'}:
+            raise ValueError('USDT network must be TRON or BSC')
+        if self.asset != 'USDT' and self.network is not None:
+            raise ValueError('Network is only valid for USDT')
+        return self
 
 
 @app.post("/billing/deposits/btcpay")
@@ -879,7 +973,8 @@ def create_btcpay_deposit(request: BtcPayDepositRequest, req: Request):
         with db() as conn:
             store_key = {'LTC': 'btcpay_ltc_store_id', 'USDT': 'btcpay_usdt_store_id'}.get(request.asset)
             store_id = _app_setting(conn, store_key) if store_key else None
-        invoice = btcpay_create_invoice(f"{request.amount_cents / 100:.2f}", order_id, store_id=store_id)
+        payment_methods = {'LTC': ['LTC'], 'USDT': [f"USDT-{request.network}"]}.get(request.asset)
+        invoice = btcpay_create_invoice(f"{request.amount_cents / 100:.2f}", order_id, store_id=store_id, payment_methods=payment_methods)
     except Exception as exc:
         logging.exception("BTCPay invoice creation failed")
         raise HTTPException(502, "Could not create BTCPay invoice") from exc
@@ -888,17 +983,35 @@ def create_btcpay_deposit(request: BtcPayDepositRequest, req: Request):
     if not invoice_id or not checkout_url:
         raise HTTPException(502, "BTCPay returned an incomplete invoice")
     with db() as conn:
-        conn.execute("INSERT INTO wallet_deposits(id,user_id,btcpay_invoice_id,requested_cents,asset,status) VALUES(%s,%s,%s,%s,%s,'pending')", (deposit_id, uid, invoice_id, request.amount_cents, request.asset))
+        conn.execute("INSERT INTO wallet_deposits(id,user_id,btcpay_invoice_id,requested_cents,asset,network,status) VALUES(%s,%s,%s,%s,%s,%s,'pending')", (deposit_id, uid, invoice_id, request.amount_cents, request.asset, request.network))
         conn.commit()
-    return {"deposit_id": str(deposit_id), "invoice_id": invoice_id, "requested_cents": request.amount_cents, "checkout_url": checkout_url, "invoice": invoice}
+    return {"deposit_id": str(deposit_id), "invoice_id": invoice_id, "requested_cents": request.amount_cents, "asset": request.asset, "network": request.network, "checkout_url": checkout_url, "invoice": invoice}
+
+
+@app.post("/billing/deposits/{deposit_id}/refresh")
+def refresh_btcpay_deposit(deposit_id: str, req: Request):
+    user = current_user(req)
+    with db() as conn:
+        row = conn.execute("SELECT btcpay_invoice_id,asset,network,status FROM wallet_deposits WHERE id=%s AND user_id=%s", (uuid.UUID(deposit_id), uuid.UUID(user["id"]))).fetchone()
+        if not row:
+            raise HTTPException(404, "Deposit not found")
+        invoice_id, asset, network, local_status = row
+        store_key = {'LTC': 'btcpay_ltc_store_id', 'USDT': 'btcpay_usdt_store_id'}.get(asset)
+        store_id = _app_setting(conn, store_key) if store_key else None
+    try:
+        invoice = btcpay_get_invoice(invoice_id, store_id=store_id)
+    except Exception as exc:
+        logging.exception("BTCPay invoice refresh failed")
+        raise HTTPException(502, "Could not refresh payment status") from exc
+    return {"deposit_id": deposit_id, "invoice_id": invoice_id, "asset": asset, "network": network, "local_status": local_status, "status": invoice.get("status"), "additional_status": invoice.get("additionalStatus"), "payments": invoice.get("payments") or [], "payment_methods": invoice.get("paymentMethods") or []}
 
 
 @app.get("/billing/deposits")
 def list_btcpay_deposits(req: Request):
     user = current_user(req)
     with db() as conn:
-        rows = conn.execute("SELECT id,btcpay_invoice_id,requested_cents,asset,paid_btc,status,settled_at,created_at FROM wallet_deposits WHERE user_id=%s ORDER BY created_at DESC LIMIT 50", (uuid.UUID(user["id"]),)).fetchall()
-    return [{"id": str(r[0]), "invoice_id": r[1], "requested_cents": int(r[2]), "asset": r[3], "paid_amount": str(r[4]) if r[4] is not None else None, "status": r[5], "settled_at": r[6].isoformat() if r[6] else None, "created_at": r[7].isoformat()} for r in rows]
+        rows = conn.execute("SELECT id,btcpay_invoice_id,requested_cents,asset,network,paid_btc,status,settled_at,created_at FROM wallet_deposits WHERE user_id=%s ORDER BY created_at DESC LIMIT 50", (uuid.UUID(user["id"]),)).fetchall()
+    return [{"id": str(r[0]), "invoice_id": r[1], "requested_cents": int(r[2]), "asset": r[3], "network": r[4], "paid_amount": str(r[5]) if r[5] is not None else None, "status": r[6], "settled_at": r[7].isoformat() if r[7] else None, "created_at": r[8].isoformat()} for r in rows]
 
 
 @app.post("/billing/deposits/btcpay/webhook")
@@ -916,19 +1029,21 @@ async def btcpay_webhook(req: Request):
         return {"ok": True, "ignored": True}
     if event_type not in {"InvoiceProcessing", "InvoiceSettled", "InvoiceExpired", "InvoiceInvalid"}:
         return {"ok": True, "ignored": True}
+    notification = None
     with db() as conn:
-        row = conn.execute("SELECT id,user_id,requested_cents,paid_btc,status FROM wallet_deposits WHERE btcpay_invoice_id=%s FOR UPDATE", (invoice_id,)).fetchone()
+        row = conn.execute("SELECT d.id,d.user_id,d.requested_cents,d.asset,d.network,d.paid_btc,d.status,u.email FROM wallet_deposits d JOIN users u ON u.id=d.user_id WHERE d.btcpay_invoice_id=%s FOR UPDATE", (invoice_id,)).fetchone()
         if not row:
             return {"ok": True, "ignored": True}
-        deposit_id, uid, requested_cents, paid_btc, current_status = row
+        deposit_id, uid, requested_cents, asset, network, paid_btc, current_status, user_email = row
         if event_type == "InvoiceSettled" and current_status != "settled":
-            amount_btc = btcpay_payment_btc(payload)
+            amount_btc = btcpay_payment_btc(payload) if asset == 'BTC' else None
             balance = conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s FOR UPDATE", (uid,)).fetchone()
             if not balance: raise HTTPException(500, "Wallet not initialized")
             new_balance = int(balance[0]) + int(requested_cents)
             conn.execute("UPDATE wallets SET balance_cents=%s,updated_at=now() WHERE user_id=%s", (new_balance, uid))
             conn.execute("INSERT INTO wallet_transactions(id,user_id,amount_cents,balance_after_cents,transaction_type,reference_id) VALUES(%s,%s,%s,%s,'btcpay_deposit',%s) ON CONFLICT(user_id,transaction_type,reference_id) DO NOTHING", (uuid.uuid4(), uid, requested_cents, new_balance, str(deposit_id)))
             conn.execute("UPDATE wallet_deposits SET status='settled',paid_btc=%s,settled_at=now(),updated_at=now() WHERE id=%s", (amount_btc, deposit_id))
+            notification = (user_email, int(requested_cents), f"{asset}{(' / ' + network) if network else ''} deposit received · BTCPay invoice {invoice_id}", new_balance)
         elif event_type == "InvoiceProcessing" and current_status == "pending":
             conn.execute("UPDATE wallet_deposits SET status='processing',updated_at=now() WHERE id=%s", (deposit_id,))
         elif event_type == "InvoiceExpired" and current_status not in ('settled',):
@@ -936,6 +1051,11 @@ async def btcpay_webhook(req: Request):
         elif event_type == "InvoiceInvalid" and current_status not in ('settled',):
             conn.execute("UPDATE wallet_deposits SET status='invalid',updated_at=now() WHERE id=%s", (deposit_id,))
         conn.commit()
+    if notification:
+        try:
+            _send_wallet_adjustment_email(*notification)
+        except Exception:
+            logging.exception("BTCPay deposit notification email failed")
     return {"ok": True}
 
 
@@ -1018,7 +1138,7 @@ def admin_deposits(req: Request, status: str = "pending", page: int = 1, page_si
             SELECT d.id,u.email,d.method,d.amount_cents,d.reference,d.sender_name,d.notes,d.status,d.created_at,'manual' AS source,TRUE AS reviewable
             FROM manual_deposits d JOIN users u ON u.id=d.user_id
             UNION ALL
-            SELECT d.id,u.email,'BTCPay / ' || d.asset,d.requested_cents,d.btcpay_invoice_id,NULL,NULL,d.status,d.created_at,'btcpay' AS source,FALSE AS reviewable
+            SELECT d.id,u.email,'BTCPay / ' || d.asset || COALESCE(' / ' || d.network,''),d.requested_cents,d.btcpay_invoice_id,NULL,NULL,d.status,d.created_at,'btcpay' AS source,FALSE AS reviewable
             FROM wallet_deposits d JOIN users u ON u.id=d.user_id
         ) deposits WHERE {status_clause}{search_clause}"""
         total=int(conn.execute(f"SELECT count(*) FROM ({base}) q",tuple(args)).fetchone()[0])
@@ -1180,13 +1300,13 @@ def admin_user_detail(user_id: str, req: Request, wallet_page: int = 1, wallet_p
     except ValueError as exc: raise HTTPException(422,"Invalid user id") from exc
     wallet_page=max(1,wallet_page); wallet_page_size=max(5,min(wallet_page_size,50))
     with db() as conn:
-        row=conn.execute("SELECT u.id,u.email,u.created_at,COALESCE(w.balance_cents,0) FROM users u LEFT JOIN wallets w ON w.user_id=u.id WHERE u.id=%s",(uid,)).fetchone()
+        row=conn.execute("SELECT u.id,u.email,u.country,u.created_at,u.last_login_at,COALESCE(w.balance_cents,0) FROM users u LEFT JOIN wallets w ON w.user_id=u.id WHERE u.id=%s",(uid,)).fetchone()
         if not row: raise HTTPException(404,"User not found")
         wallet_total=int(conn.execute("SELECT count(*) FROM wallet_transactions WHERE user_id=%s",(uid,)).fetchone()[0])
         wallet_offset=(wallet_page-1)*wallet_page_size
         tx=conn.execute("SELECT id,amount_cents,balance_after_cents,transaction_type,reference_id,created_at FROM wallet_transactions WHERE user_id=%s ORDER BY created_at DESC LIMIT %s OFFSET %s",(uid,wallet_page_size,wallet_offset)).fetchall()
         scraps=conn.execute("SELECT count(*),count(*) FILTER (WHERE status IN ('active','running')),count(*) FILTER (WHERE status IN ('completed','complete')) FROM scraps WHERE user_id=%s",(uid,)).fetchone()
-    return {"user":{"id":str(row[0]),"email":row[1],"created_at":row[2].isoformat(),"balance_cents":int(row[3])},"wallet_transactions":[{"id":str(r[0]),"amount_cents":int(r[1]),"balance_after_cents":int(r[2]),"transaction_type":r[3],"reference_id":r[4],"created_at":r[5].isoformat()} for r in tx],"wallet_pagination":{"page":wallet_page,"page_size":wallet_page_size,"total":wallet_total,"total_pages":(wallet_total+wallet_page_size-1)//wallet_page_size},"scraps":{"total":int(scraps[0]),"active":int(scraps[1]),"completed":int(scraps[2])}}
+    return {"user":{"id":str(row[0]),"email":row[1],"country":row[2],"created_at":row[3].isoformat(),"last_login_at":row[4].isoformat() if row[4] else None,"balance_cents":int(row[5])},"wallet_transactions":[{"id":str(r[0]),"amount_cents":int(r[1]),"balance_after_cents":int(r[2]),"transaction_type":r[3],"reference_id":r[4],"created_at":r[5].isoformat()} for r in tx],"wallet_pagination":{"page":wallet_page,"page_size":wallet_page_size,"total":wallet_total,"total_pages":(wallet_total+wallet_page_size-1)//wallet_page_size},"scraps":{"total":int(scraps[0]),"active":int(scraps[1]),"completed":int(scraps[2])}}
 
 @app.get("/admin/users/{user_id}/activity")
 def admin_user_activity(user_id: str, req: Request, page: int = 1, page_size: int = 20):
@@ -1264,13 +1384,13 @@ def admin_wallets(req: Request, page: int = 1, page_size: int = 25, search: str 
     return {"wallets":[{"id":str(r[0]),"email":r[1],"balance_cents":int(r[2])} for r in rows],"pagination":{"page":page,"page_size":page_size,"total":total,"total_pages":(total+page_size-1)//page_size}}
 
 @app.post("/admin/wallet-adjust")
-def adjust_wallet(request: WalletAdjustmentRequest, req: Request):
+def adjust_wallet(request: WalletAdjustmentRequest, req: Request, background_tasks: BackgroundTasks):
     user=current_user(req)
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
     with db() as conn:
-        row=conn.execute("SELECT id FROM users WHERE email=%s",(request.user_email.lower().strip(),)).fetchone()
+        row=conn.execute("SELECT id,email FROM users WHERE email=%s",(request.user_email.lower().strip(),)).fetchone()
         if not row: raise HTTPException(404,"User not found")
-        uid=row[0]
+        uid,customer_email=row
         balance=conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s FOR UPDATE",(uid,)).fetchone()[0]
         new_balance=int(balance)+request.amount_cents
         if new_balance < 0: raise HTTPException(422,"Wallet balance cannot become negative")
@@ -1278,6 +1398,7 @@ def adjust_wallet(request: WalletAdjustmentRequest, req: Request):
         conn.execute("INSERT INTO wallet_transactions(id,user_id,amount_cents,balance_after_cents,transaction_type) VALUES(%s,%s,%s,%s,'admin_adjustment')",(uuid.uuid4(),uid,request.amount_cents,new_balance))
         _audit(conn,user["id"],"wallet_adjustment","billing",uid,{"amount_cents":request.amount_cents,"balance_after_cents":new_balance,"reason":request.reason})
         conn.commit()
+    background_tasks.add_task(_send_wallet_adjustment_email,customer_email,request.amount_cents,request.reason,new_balance)
     return {"balance_cents":new_balance}
 
 @app.get("/scraps/current")
@@ -2023,20 +2144,26 @@ def _increment_llm_calls(scrap_id: str):
         conn.commit()
 
 
+_SERP_LEAD_PROCESS_LOCK = threading.Lock()
+
 def _process_serp_leads_background(scrap_id: str, records: list[dict]):
-    try:
-        with db() as conn:
-            row = conn.execute("SELECT user_id,criteria,crawler_config FROM scraps WHERE id=%s", (uuid.UUID(scrap_id),)).fetchone()
-        if not row:
-            return
-        user_id, raw_criteria, raw_crawler = row
-        criteria = SearchCriteria.model_validate(raw_criteria or {})
-        crawler = CrawlerConfig.model_validate(raw_crawler or {})
-        prefixes, rules = get_client_policies(str(user_id))
-        pipeline = LeadDiscoveryPipeline(crawler_config=crawler, generic_prefixes=prefixes, domain_rules=rules, llm_call_counter=lambda: _increment_llm_calls(scrap_id))
-        asyncio.run(pipeline.process_serp_records(criteria, records, scrap_id=scrap_id))
-    except Exception as exc:
-        print(f"serp_lead_processing_error={scrap_id}: {type(exc).__name__}: {exc}")
+    # SERP imports can arrive faster than contextual lead extraction completes.
+    # Keep this expensive pipeline single-flight so multiple concurrent requests
+    # cannot instantiate duplicate extractor/model state and exhaust API memory.
+    with _SERP_LEAD_PROCESS_LOCK:
+        try:
+            with db() as conn:
+                row = conn.execute("SELECT user_id,criteria,crawler_config FROM scraps WHERE id=%s", (uuid.UUID(scrap_id),)).fetchone()
+            if not row:
+                return
+            user_id, raw_criteria, raw_crawler = row
+            criteria = SearchCriteria.model_validate(raw_criteria or {})
+            crawler = CrawlerConfig.model_validate(raw_crawler or {})
+            prefixes, rules = get_client_policies(str(user_id))
+            pipeline = LeadDiscoveryPipeline(crawler_config=crawler, generic_prefixes=prefixes, domain_rules=rules, llm_call_counter=lambda: _increment_llm_calls(scrap_id))
+            asyncio.run(pipeline.process_serp_records(criteria, records, scrap_id=scrap_id))
+        except Exception as exc:
+            print(f"serp_lead_processing_error={scrap_id}: {type(exc).__name__}: {exc}")
 
 
 @app.post("/serp/import")

@@ -1,8 +1,8 @@
 # Scrappee Browser Extension — Source of Truth
 
 **Status:** APPROVED / CANONICAL
-**Version:** 0.6.12
-**Date:** 2026-09-28
+**Version:** 0.6.13
+**Date:** 2026-10-01
 
 ## Purpose
 

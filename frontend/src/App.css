@@ -384,3 +384,35 @@ html,body,#root,.app-shell,.sidebar,main{scrollbar-width:none;-ms-overflow-style
 .login-card select{display:block;width:100%;margin-top:7px;border:1px solid transparent;border-radius:7px;background:#f4f5f6;padding:13px 12px;outline:none;font:inherit;font-size:12px;box-sizing:border-box}.login-card select:focus{box-shadow:0 0 0 2px #ccd2da}.login-card .success{margin-bottom:12px;color:#3d6b28;background:#eff8e9;border:1px solid #cfe5c0;border-radius:8px;padding:9px 11px;font-size:12px}.country-hint{display:block;margin-top:5px;color:#8a9098;font-size:10px}
 
 .login-forgot{display:block;margin:14px auto 0;border:0;background:none;color:#667085;font:inherit;font-size:12px;cursor:pointer}.login-forgot:hover{text-decoration:underline}.login-back{display:block;margin:14px auto 0;border:0;background:none;color:#667085;font:inherit;font-size:12px;cursor:pointer}.login-back:hover{text-decoration:underline}
+
+.deposit-network-tabs{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:-8px 0 18px;padding:4px;background:#f3f1eb;border:1px solid #e6e2da;border-radius:10px}.deposit-network-tabs button{border:0;background:transparent;color:#6f6b63;border-radius:7px;padding:9px 8px;font-size:10px;font-weight:750;cursor:pointer}.deposit-network-tabs button.active{background:#fff;color:#171916;box-shadow:0 1px 2px rgba(0,0,0,.08)}.deposit-history-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding-bottom:14px}.deposit-history-head .secondary{display:inline-flex;align-items:center;gap:6px}.deposit-history-actions{display:flex;align-items:center;justify-content:flex-end;gap:10px}.deposit-history-actions .secondary{display:inline-flex;align-items:center;gap:5px;padding:7px 9px}.deposit-history-row small{color:#858078}.deposit-history-row .spin{animation:deposit-spin .8s linear infinite}@keyframes deposit-spin{to{transform:rotate(360deg)}}@media(max-width:800px){.deposit-history-actions{justify-content:flex-start;flex-wrap:wrap}.deposit-network-tabs{margin-top:0}}
+
+/* Deposit page — final UI refinement */
+.deposit-grid:has(> .panel:only-child){grid-template-columns:minmax(0,1fr)}
+.deposit-grid>.panel:first-child{border-color:#e4e0d7;box-shadow:0 2px 10px rgba(25,24,21,.025)}
+.deposit-grid label{display:grid;gap:7px;margin-top:18px;color:#5f5a52;font-size:11px;font-weight:700}
+.deposit-grid label input{width:100%;height:42px;box-sizing:border-box;padding:0 13px;border:1px solid #dcd8d0;border-radius:9px;background:#fff;color:#171916;font:inherit;font-size:13px;outline:none}
+.deposit-grid label input:focus{border-color:#b8bfaa;box-shadow:0 0 0 3px rgba(217,255,98,.18)}
+.deposit-action{height:43px;border-radius:9px;font-size:12px;font-weight:800}
+.deposit-tabs{margin-top:20px;margin-bottom:4px}
+.deposit-tabs button{min-height:40px}
+.deposit-network-tabs{margin:10px 0 4px}
+.deposit-network-tabs button{min-height:38px}
+.deposit-note{font-size:10px;line-height:1.55;margin-bottom:0}
+.deposit-history-head{padding:20px 20px 15px}
+.deposit-history-head .panel-title{font-size:14px}
+.deposit-history-head .muted{margin-top:5px}
+.deposit-history{padding:0 20px}
+.deposit-history-row{grid-template-columns:minmax(240px,1fr) 90px 105px 210px;min-height:68px;padding:13px 0}
+.deposit-history-row>div:first-child{min-width:0}
+.deposit-history-row>div:first-child b{font-size:12px;line-height:1.25}
+.deposit-history-row>div:first-child span{font-size:9px;margin-top:5px}
+.deposit-history-row>div:first-child small{display:block;margin-top:5px;font-size:9px;color:#8a857d}
+.deposit-history-row>strong{font-size:12px;text-align:right}
+.deposit-history-row>.badge{justify-self:start}
+.deposit-history-actions{min-width:0}
+.deposit-history-actions>small{font-size:9px;white-space:nowrap}
+.deposit-history-actions .secondary{height:30px;white-space:nowrap}
+@media(max-width:950px){.deposit-history-row{grid-template-columns:minmax(190px,1fr) 80px 95px 180px;gap:10px}}
+@media(max-width:800px){.deposit-grid>.panel:first-child{padding:20px}.deposit-grid>.panel:nth-child(2){padding:20px}.deposit-history-head{padding:18px 16px 13px}.deposit-history{padding:0 16px}.deposit-history-row{grid-template-columns:1fr auto;gap:9px;padding:14px 0}.deposit-history-row>strong{grid-column:2;grid-row:1;text-align:right}.deposit-history-row>.badge{grid-column:2;grid-row:2;justify-self:end}.deposit-history-actions{grid-column:1/-1;justify-content:space-between;padding-top:3px}.deposit-history-row>div:first-child{grid-column:1;grid-row:1 / span 2}.deposit-history-actions>small{display:none}}
+.lead-header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.export-compact{display:flex;gap:6px}.export-compact .secondary{height:38px;min-width:48px;padding:0 11px}.lead-header-actions .secondary{white-space:nowrap}

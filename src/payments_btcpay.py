@@ -16,7 +16,7 @@ def _headers():
     return {'Authorization': f'token {BTCPAY_API_KEY}', 'Content-Type': 'application/json'}
 
 
-def create_invoice(amount_usd: str, order_id: str, store_id: str | None = None):
+def create_invoice(amount_usd: str, order_id: str, store_id: str | None = None, payment_methods: list[str] | None = None):
     if not configured():
         raise RuntimeError('BTCPay is not configured')
     target_store = (store_id or BTCPAY_STORE_ID).strip()
@@ -24,7 +24,7 @@ def create_invoice(amount_usd: str, order_id: str, store_id: str | None = None):
         raise RuntimeError('BTCPay store is not configured')
     response = requests.post(
         f'{BTCPAY_URL}/api/v1/stores/{target_store}/invoices',
-        headers=_headers(), json={'amount': amount_usd, 'currency': 'USD', 'orderId': order_id}, timeout=20,
+        headers=_headers(), json={'amount': amount_usd, 'currency': 'USD', 'orderId': order_id, **({'checkout': {'paymentMethods': payment_methods}} if payment_methods else {})}, timeout=20,
     )
     if not response.ok:
         import logging
@@ -32,6 +32,18 @@ def create_invoice(amount_usd: str, order_id: str, store_id: str | None = None):
         if response.status_code == 403:
             stores_response = requests.get(f'{BTCPAY_URL}/api/v1/stores', headers=_headers(), timeout=20)
             logging.error("BTCPay accessible stores %s: %s", stores_response.status_code, stores_response.text[:2000])
+    response.raise_for_status()
+    return response.json()
+
+
+def get_invoice(invoice_id: str, store_id: str | None = None):
+    if not configured():
+        raise RuntimeError('BTCPay is not configured')
+    target_store = (store_id or BTCPAY_STORE_ID).strip()
+    response = requests.get(
+        f'{BTCPAY_URL}/api/v1/stores/{target_store}/invoices/{invoice_id}',
+        headers=_headers(), timeout=20,
+    )
     response.raise_for_status()
     return response.json()
 

@@ -132,7 +132,26 @@ async function captureSerpPage(){
  if(/\/sorry\//.test(location.href.toLowerCase())||/captcha|unusual traffic|verify you are human/.test(text))return{ok:false,challenge:true,error:'Search-engine challenge detected.'};
  const seen=new Set(),results=[];
  const add=(a,card)=>{if(!a)return;let u;try{u=new URL(a.getAttribute('href')||a.href,location.href);}catch(_){return;}if(!/^https?:$/.test(u.protocol)||/^(www\.)?(google|bing)\./i.test(u.hostname))return;const title=(a.querySelector('h3,h2')?.innerText||card?.querySelector('h3,h2')?.innerText||a.innerText||'').trim();if(!title)return;const snippet=(card?.querySelector('.VwiC3b,[data-sncf],div.IsZvec,.kb0PBd,.yXK7lf,.b_caption p,.b_caption,div[class*="snippet"],div[class*="caption"]')?.innerText||'').trim();let raw_text=(card?.innerText||'').trim();if(raw_text.length<snippet.length+20){let n=a;for(let i=0;i<5&&n;i++,n=n.parentElement){const t=(n.innerText||'').trim();if(t.length>raw_text.length&&t.length<5000)raw_text=t;}}const key=`${u.href}\n${title}\n${snippet}`;if(seen.has(key))return;seen.add(key);results.push({url:u.href,title,snippet,raw_text,provider:google?'google':'bing',page_url:location.href});};
- const scan=()=>{if(google){for(const a of document.querySelectorAll('a[href]:has(h3),h3 a[href],h2 a[href]'))add(a,a.closest('div.MjjYud,div.tF2Cxc'));}else{const anchors=[...document.querySelectorAll('h2 a[href],h3 a[href]')];for(const a of anchors)add(a,a.closest('li.b_algo,li,[data-bm],div'));for(const a of document.querySelectorAll('a[href]')){const t=(a.innerText||'').trim();if(t.length>15&&a.querySelector('h2,h3'))add(a,a.closest('li.b_algo,li,[data-bm],div'));}}}; let stable=0,last=-1;for(let i=0;i<40;i++){const before=results.length;scan();const h=document.documentElement.scrollHeight,bottom=scrollY+innerHeight>=h-40;if(bottom&&results.length===before)stable++;else stable=0;if(bottom&&stable>=3)break;if(h===last&&bottom)stable++;last=h;scrollTo(0,Math.min(h,scrollY+Math.max(500,Math.floor(innerHeight*.85))));await new Promise(r=>setTimeout(r,650));}scan();
+ const scan=()=>{if(google){for(const a of document.querySelectorAll('a[href]:has(h3),h3 a[href],h2 a[href]'))add(a,a.closest('div.MjjYud,div.tF2Cxc'));}else{const anchors=[...document.querySelectorAll('h2 a[href],h3 a[href]')];for(const a of anchors)add(a,a.closest('li.b_algo,li,[data-bm],div'));for(const a of document.querySelectorAll('a[href]')){const t=(a.innerText||'').trim();if(t.length>15&&a.querySelector('h2,h3'))add(a,a.closest('li.b_algo,li,[data-bm],div'));}}};
+ let stable=0,lastHeight=-1,lastResults=-1;
+ for(let i=0;i<60;i++){
+   const before=results.length; scan();
+   const root=document.documentElement, body=document.body;
+   const height=Math.max(root?.scrollHeight||0,body?.scrollHeight||0);
+   const y=window.scrollY||window.pageYOffset||0, viewport=window.innerHeight||0;
+   const bottom=y+viewport>=height-80;
+   if(bottom&&results.length===before) stable++; else stable=0;
+   if(bottom&&stable>=4) break;
+   const next=Math.min(Math.max(0,height-viewport),y+Math.max(450,Math.floor(viewport*.8)));
+   if(next<=y+4){await new Promise(r=>setTimeout(r,900));scan();const h2=Math.max(root?.scrollHeight||0,body?.scrollHeight||0);if(h2<=height&&results.length===before) stable++;continue;}
+   window.scrollTo({top:next,behavior:'smooth'});
+   await new Promise(r=>setTimeout(r,900));
+   scan();
+   const newHeight=Math.max(root?.scrollHeight||0,body?.scrollHeight||0);
+   if(newHeight===lastHeight&&results.length===lastResults&&next>=newHeight-(window.innerHeight||0)-80) stable++; else if(newHeight!==lastHeight||results.length!==lastResults) stable=0;
+   lastHeight=newHeight; lastResults=results.length;
+ }
+ scan();
  let next=null;const nextSelectors=google?['a#pnnext','a[aria-label="Next"]','a[aria-label*="Next"]']:['a.sb_pagN','a[aria-label="Next page"]','a[title="Next page"]','a[aria-label*="Next"]'];
  for(const selector of nextSelectors){const a=document.querySelector(selector);if(a?.href&&isHttp(a.href)){next=a.href;break;}}
  return{ok:true,results,pageKey:location.origin+location.pathname+'?'+new URL(location.href).searchParams.toString(),nextHref:next,challengeNext:false};

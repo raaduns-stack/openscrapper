@@ -273,6 +273,7 @@ def init_db():
         conn.execute("ALTER TABLE users ADD CONSTRAINT users_role_check CHECK(role IN ('user','admin'))")
         conn.execute("ALTER TABLE sender_oauth_states ALTER COLUMN sender_id DROP NOT NULL")
         conn.execute("ALTER TABLE wallet_deposits ADD COLUMN IF NOT EXISTS asset TEXT NOT NULL DEFAULT 'BTC'")
+        conn.execute("ALTER TABLE wallet_deposits ADD COLUMN IF NOT EXISTS network TEXT")
         conn.execute("ALTER TABLE sender_oauth_states ADD COLUMN IF NOT EXISTS display_name TEXT")
         conn.execute("DELETE FROM sender_accounts WHERE provider='gmail_oauth' AND email IS NULL AND NOT (config ? 'oauth_email')")
         conn.execute("UPDATE sender_accounts SET config=config || '{\"throttle_seconds\":60}'::jsonb WHERE provider='smtp' AND NOT (config ? 'throttle_seconds')")
