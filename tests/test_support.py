@@ -1,5 +1,6 @@
 import os
 import uuid
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -102,3 +103,43 @@ def test_support_attachment_response_does_not_expose_storage_path():
                          files={"file": ("note.txt", b"support attachment", "text/plain")})
     assert upload.status_code == 200
     assert "storage_path" not in upload.json()["attachments"][-1]
+
+def test_admin_support_reply_sends_customer_email_notification():
+    client = TestClient(api.app)
+    customer, customer_email = _register(client, "support-email-customer")
+    admin, admin_email = _register(client, "support-email-admin")
+    os.environ["ADMIN_EMAILS"] = admin_email
+    customer_headers = {"Authorization": f"Bearer {customer['token']}"}
+    admin_headers = {"Authorization": f"Bearer {admin['token']}"}
+    created = client.post("/support/tickets", headers=customer_headers, json={
+        "subject": "Extension is not working",
+        "category": "system",
+        "description": "The extension stops while scraping.",
+    })
+    assert created.status_code == 200
+    ticket_id = created.json()["id"]
+    sent = []
+
+    class FakeSMTP:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def login(self, *_):
+            pass
+
+        def sendmail(self, sender, recipients, message):
+            sent.append((sender, recipients, message))
+
+    with patch.object(api.smtplib, "SMTP_SSL", return_value=FakeSMTP()):
+        response = client.post(f"/admin/support/tickets/{ticket_id}/messages", headers=admin_headers,
+                               json={"body": "Please reinstall the extension and sign in again."})
+
+    assert response.status_code == 200
+    assert len(sent) == 1
+    assert sent[0][1] == [customer_email]
+    assert "support ticket responded to" in sent[0][2]
+    assert "Please reinstall the extension and sign in again." in sent[0][2]
+    assert "Action required:" in sent[0][2]

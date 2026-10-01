@@ -354,12 +354,16 @@ def admin_support_ticket(ticket_id: str, req: Request):
     return item
 
 @app.post("/admin/support/tickets/{ticket_id}/messages")
-def admin_support_message(ticket_id: str, request: SupportMessageRequest, req: Request):
+def admin_support_message(ticket_id: str, request: SupportMessageRequest, req: Request, background_tasks: BackgroundTasks):
     user = _support_admin(req)
     try: tid = uuid.UUID(ticket_id)
     except ValueError: raise HTTPException(422, "Invalid ticket id")
     item = support_service.add_message(uuid.UUID(user["id"]), tid, request.body, admin=True)
     if not item: raise HTTPException(404, "Ticket not found")
+    with db() as conn:
+        row = conn.execute("SELECT u.email,t.subject FROM support_tickets t JOIN users u ON u.id=t.user_id WHERE t.id=%s", (tid,)).fetchone()
+    if row and row[0]:
+        background_tasks.add_task(_send_support_reply_email_safe, row[0], str(tid), row[1] or "Support request", request.body)
     return item
 
 @app.post("/admin/support/tickets/{ticket_id}/internal-note")
@@ -475,6 +479,53 @@ If you did not request this, you can safely ignore this email.
     with smtplib.SMTP_SSL(smtp_host,smtp_port,context=context,timeout=15) as smtp:
         smtp.login(smtp_user,smtp_password)
         smtp.sendmail(from_address,[email],msg)
+
+def _send_support_reply_email(email, ticket_id, subject, reply_body):
+    base_url=os.getenv("SCRAPPEE_APP_URL","https://scrapee.uk").rstrip("/")
+    from_address=os.getenv("SCRAPPEE_MAIL_FROM","Scrappee <noreply@scrapee.uk>")
+    ticket_link=f"{base_url}/support"
+    preview=reply_body.strip()
+    if len(preview) > 1200:
+        preview=preview[:1200].rstrip()+"…"
+    msg=f"""From: {from_address}
+To: {email}
+Subject: Scrappee support ticket responded to: {subject}
+Content-Type: text/plain; charset=UTF-8
+
+Your Scrappee support ticket has been responded to by our support team.
+
+Ticket: {subject}
+Ticket ID: {ticket_id}
+
+Support response:
+{preview}
+
+Action required:
+Please log in to Scrappee and review the response. If the issue is not resolved, reply to the ticket from your Support Centre.
+
+Open Support Centre:
+{ticket_link}
+
+This is an automated notification from Scrappee.
+"""
+    smtp_host=os.getenv("SCRAPPEE_SMTP_HOST","")
+    smtp_port=int(os.getenv("SCRAPPEE_SMTP_PORT","465"))
+    smtp_user=os.getenv("SCRAPPEE_SMTP_USER","")
+    smtp_password=os.getenv("SCRAPPEE_SMTP_PASSWORD","") or base64.b64decode(os.getenv("SCRAPPEE_SMTP_PASSWORD_B64","")).decode()
+    if not smtp_host or not smtp_user or not smtp_password:
+        raise RuntimeError("SMTP support notification delivery is not configured")
+    context=ssl.create_default_context()
+    with smtplib.SMTP_SSL(smtp_host,smtp_port,context=context,timeout=15) as smtp:
+        smtp.login(smtp_user,smtp_password)
+        smtp.sendmail(from_address,[email],msg)
+
+
+def _send_support_reply_email_safe(email, ticket_id, subject, reply_body):
+    try:
+        _send_support_reply_email(email, ticket_id, subject, reply_body)
+    except Exception:
+        logging.exception("Support reply email delivery failed for ticket %s", ticket_id)
+
 
 def _send_wallet_adjustment_email(email, amount_cents, reason, new_balance_cents):
     from_address=os.getenv("SCRAPPEE_MAIL_FROM","Scrappee <noreply@scrapee.uk>")
