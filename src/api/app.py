@@ -887,8 +887,8 @@ def admin_search_template_categories(req: Request):
     user=current_user(req)
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
     with db() as conn:
-        rows=conn.execute("SELECT id,name,active,position FROM search_template_categories ORDER BY position,name").fetchall()
-    return [{"id":str(r[0]),"name":r[1],"active":r[2],"position":r[3]} for r in rows]
+        rows=conn.execute("SELECT id,name,stable_key,active,position FROM search_template_categories ORDER BY position,name").fetchall()
+    return [{"id":str(r[0]),"name":r[1],"stable_key":r[2],"active":r[3],"position":r[4]} for r in rows]
 
 @app.post("/admin/search-template-categories")
 def admin_add_search_template_category(request: SearchTemplateCategoryRequest, req: Request):
@@ -976,6 +976,18 @@ def admin_patch_search_template_category(category_id: str, request: dict, req: R
                 for position,item_id in enumerate(ids): conn.execute("UPDATE search_template_categories SET position=%s WHERE id=%s",(position,item_id))
         conn.commit()
     return {"id":category_id}
+
+@app.delete("/admin/search-template-categories/{category_id}",status_code=204)
+def admin_delete_search_template_category(category_id: str, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    cid=uuid.UUID(category_id)
+    with db() as conn:
+        row=conn.execute("SELECT stable_key FROM search_template_categories WHERE id=%s",(cid,)).fetchone()
+        if not row: raise HTTPException(404,"Search template category not found")
+        if row[0]: raise HTTPException(409,"Built-in categories cannot be deleted")
+        conn.execute("DELETE FROM search_template_categories WHERE id=%s",(cid,))
+        conn.commit()
 
 @app.delete("/admin/search-templates/{template_id}",status_code=204)
 def admin_delete_search_template(template_id: str, req: Request):
