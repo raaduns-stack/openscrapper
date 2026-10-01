@@ -977,7 +977,7 @@ def admin_patch_search_template_category(category_id: str, request: dict, req: R
         conn.commit()
     return {"id":category_id}
 
-@app.delete("/admin/search-template-categories/{category_id}",status_code=204)
+@app.delete("/admin/search-template-categories/{category_id}")
 def admin_delete_search_template_category(category_id: str, req: Request):
     user=current_user(req)
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
@@ -988,6 +988,7 @@ def admin_delete_search_template_category(category_id: str, req: Request):
         if row[0]: raise HTTPException(409,"Built-in categories cannot be deleted")
         conn.execute("DELETE FROM search_template_categories WHERE id=%s",(cid,))
         conn.commit()
+    return {"deleted": True, "id": category_id}
 
 @app.delete("/admin/search-templates/{template_id}",status_code=204)
 def admin_delete_search_template(template_id: str, req: Request):
