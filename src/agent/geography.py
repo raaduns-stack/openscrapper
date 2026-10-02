@@ -1,4 +1,5 @@
 import json
+import random
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -137,7 +138,18 @@ class GeographyResolver:
         """
         raw = str(value or "").strip()
         if not raw:
-            return {"geography-1": [""], "geography-2": [""], "geography-3": [""]}
+            # No location was supplied: choose one valid country as the explicit
+            # geography fallback, then derive its verified hierarchy.
+            candidates = [c for c in self.countries if str(c.get("name", "")).strip()]
+            if not candidates:
+                return {"geography-1": [""], "geography-2": [], "geography-3": []}
+            fallback = random.choice(candidates)
+            result = self.resolve(str(fallback.get("name")).strip())
+            return {
+                "geography-1": [result.country],
+                "geography-2": [state.name for state in result.states],
+                "geography-3": [city for state in result.states for city in state.cities],
+            }
 
         norm = self._norm(raw)
         country = self._country_index.get(norm)
