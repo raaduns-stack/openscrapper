@@ -529,6 +529,12 @@ Secrets such as SMTP passwords or OAuth credentials must never be displayed.
 
 ### 7.3.11 SERP, Search Templates and Research Controls
 
+
+### 7.3.12 Search Templates Administrator Completion — 2026-10-02
+
+The Search Templates page exposes category and template configuration as a persistent administrator workflow. Categories and templates support priority ordering through move-up/move-down controls; category active state is editable; built-in categories remain protected from deletion while custom categories are deletable; template variable validation follows the deterministic template engine grammar; and the UI shows active-template capacity. Existing CRUD, rename, provider filtering, geography variables, and database persistence remain unchanged.
+
+
 Existing admin-backed controls include:
 
 - premium SERP providers

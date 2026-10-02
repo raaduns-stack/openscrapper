@@ -917,9 +917,12 @@ def admin_add_search_template(request: SearchTemplateRequest, req: Request):
     if any(v not in VARIABLES for v in __import__("re").findall(r"{([a-z_]+)}",request.template)):
         raise HTTPException(422,"Template contains an unsupported variable")
     with db() as conn:
-        exists=conn.execute("SELECT 1 FROM search_template_categories WHERE id=%s",(uuid.UUID(request.category_id),)).fetchone()
+        category_id=uuid.UUID(request.category_id)
+        exists=conn.execute("SELECT 1 FROM search_template_categories WHERE id=%s",(category_id,)).fetchone()
         if not exists: raise HTTPException(404,"Search template category not found")
-        row=conn.execute("INSERT INTO search_templates(id,category_id,provider,family,template,active,position) VALUES(gen_random_uuid(),%s,%s,%s,%s,%s,(SELECT COALESCE(MAX(position),0)+1 FROM search_templates WHERE category_id=%s)) RETURNING id,provider,family,template,active,position",(uuid.UUID(request.category_id),request.provider,request.family.strip(),request.template.strip(),request.active,uuid.UUID(request.category_id))).fetchone()
+        duplicate=conn.execute("SELECT 1 FROM search_templates WHERE category_id=%s AND provider=%s AND family=%s AND template=%s LIMIT 1",(category_id,request.provider,request.family.strip(),request.template.strip())).fetchone()
+        if duplicate: raise HTTPException(409,"This template already exists in the selected category")
+        row=conn.execute("INSERT INTO search_templates(id,category_id,provider,family,template,active,position) VALUES(gen_random_uuid(),%s,%s,%s,%s,%s,(SELECT COALESCE(MAX(position),0)+1 FROM search_templates WHERE category_id=%s)) RETURNING id,provider,family,template,active,position",(category_id,request.provider,request.family.strip(),request.template.strip(),request.active,category_id)).fetchone()
         conn.commit()
     return {"id":str(row[0]),"provider":row[1],"family":row[2],"template":row[3],"active":row[4],"position":row[5]}
 
@@ -936,10 +939,16 @@ def admin_patch_search_template(template_id: str, request: dict, req: Request):
         if "provider" in request:
             provider=str(request["provider"]).strip().lower()
             if provider not in ("google","bing"): raise HTTPException(422,"Unsupported search provider")
+            current=conn.execute("SELECT category_id,family,template FROM search_templates WHERE id=%s",(tid,)).fetchone()
+            duplicate=conn.execute("SELECT 1 FROM search_templates WHERE category_id=%s AND provider=%s AND family=%s AND template=%s AND id<>%s LIMIT 1",(current[0],provider,current[1],current[2],tid)).fetchone()
+            if duplicate: raise HTTPException(409,"This template already exists in the selected category")
             conn.execute("UPDATE search_templates SET provider=%s WHERE id=%s",(provider,tid))
         if "family" in request:
             family=str(request["family"]).strip()
             if not family: raise HTTPException(422,"Family cannot be empty")
+            current=conn.execute("SELECT category_id,provider,template FROM search_templates WHERE id=%s",(tid,)).fetchone()
+            duplicate=conn.execute("SELECT 1 FROM search_templates WHERE category_id=%s AND provider=%s AND family=%s AND template=%s AND id<>%s LIMIT 1",(current[0],current[1],family,current[2],tid)).fetchone()
+            if duplicate: raise HTTPException(409,"This template already exists in the selected category")
             conn.execute("UPDATE search_templates SET family=%s WHERE id=%s",(family,tid))
         if "template" in request:
             template=str(request["template"]).strip()
@@ -967,6 +976,8 @@ def admin_patch_search_template_category(category_id: str, request: dict, req: R
         if "name" in request:
             name=str(request["name"]).strip()
             if not name: raise HTTPException(422,"Category name cannot be empty")
+            duplicate=conn.execute("SELECT 1 FROM search_template_categories WHERE lower(name)=lower(%s) AND id<>%s LIMIT 1",(name,cid)).fetchone()
+            if duplicate: raise HTTPException(409,"A category with this name already exists")
             conn.execute("UPDATE search_template_categories SET name=%s WHERE id=%s",(name,cid))
         if "position" in request:
             target=max(0,int(request["position"]))
