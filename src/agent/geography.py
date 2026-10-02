@@ -23,7 +23,15 @@ class GeographyResolver:
         self.countries = self._load("countriesminified.json")
         self.states = self._load("statesminified.json")
         self.cities = self._load("citiesminified.json")
-        self._country_index = {str(c.get("name", "")).strip().casefold(): c for c in self.countries if c.get("name")}
+        self._country_index = {}
+        for country in self.countries:
+            if not country.get("name"):
+                continue
+            canonical = str(country.get("name")).strip()
+            aliases = (canonical, country.get("iso3"), country.get("iso2"), country.get("native"))
+            for alias in aliases:
+                if alias:
+                    self._country_index[str(alias).strip().casefold()] = country
 
     @staticmethod
     def _norm(value: str | None) -> str:
