@@ -10,7 +10,10 @@ def auth_client():
     email=f"v131-{uuid.uuid4().hex}@example.test"
     r=client.post('/auth/register',json={'email':email,'password':'StrongTestPassword123!'})
     assert r.status_code==200
-    token=r.json()['token']; user_id=r.json()['user_id']
+    user_id=r.json()['user_id']
+    token=r.json().get('token')
+    if not token:
+        token=client.post('/auth/login',json={'email':email,'password':'StrongTestPassword123!'}).json()['token']
     return client,{'Authorization':f'Bearer {token}'},user_id
 
 
@@ -362,3 +365,36 @@ def test_page_indexer_discards_ineligible_without_charge():
     response=client.post('/page-indexer/process',headers=headers,json={'url':'https://example.com/about','title':'About','html':'<html><body><p>Company overview only.</p></body></html>'})
     assert response.status_code==200 and response.json()['eligible'] is False
     assert client.get('/billing',headers=headers).json()['balance_cents']==800
+
+
+def test_admin_scrap_reset_refunds_and_preserves_completed_leads(monkeypatch):
+    client,headers,user_id=auth_client(); fund(user_id,1000)
+    monkeypatch.setattr(api, '_send_wallet_adjustment_email', lambda *args: None)
+    admin_email=f"admin-{uuid.uuid4().hex}@example.test"
+    with db() as conn:
+        conn.execute("UPDATE users SET email=%s,role='admin' WHERE id=%s",(admin_email,uuid.UUID(user_id)))
+        scrap=create_scrap(client,headers,'Reset me')
+        sid=uuid.UUID(scrap['id'])
+        completed_id=uuid.uuid4(); working_id=uuid.uuid4()
+        conn.execute("INSERT INTO leads(id,scrap_id,data,status) VALUES(%s,%s,%s,'completed')",(completed_id,sid,{'first_name':'Keep','last_name':'Lead'}))
+        conn.execute("INSERT INTO leads(id,scrap_id,data,status) VALUES(%s,%s,%s,'working')",(working_id,sid,{'first_name':'Delete','last_name':'Lead'}))
+        conn.commit()
+    monkeypatch.setenv('ADMIN_EMAILS',admin_email)
+    before=client.get('/billing',headers=headers).json()['balance_cents']
+    response=client.post(f'/admin/scraps/{scrap["id"]}/reset',headers=headers)
+    assert response.status_code==200 and response.json()['refunded_cents']==scrap['charged_cents']
+    assert client.get('/billing',headers=headers).json()['balance_cents']==before+scrap['charged_cents']
+    with db() as conn:
+        assert conn.execute("SELECT count(*) FROM scraps WHERE id=%s",(sid,)).fetchone()[0]==0
+        assert conn.execute("SELECT scrap_id,user_id,status FROM leads WHERE id=%s",(completed_id,)).fetchone()==(None,uuid.UUID(user_id),'completed')
+        assert conn.execute("SELECT count(*) FROM leads WHERE id=%s",(working_id,)).fetchone()[0]==0
+        assert conn.execute("SELECT count(*) FROM wallet_transactions WHERE user_id=%s AND transaction_type='scrap_reset_refund' AND reference_id=%s",(uuid.UUID(user_id),str(sid))).fetchone()[0]==1
+        assert conn.execute("SELECT count(*) FROM admin_audit_events WHERE action='scrap_reset' AND metadata->>'scrap_id'=%s",(str(sid),)).fetchone()[0]==1
+
+
+def test_admin_scrap_reset_is_admin_only(monkeypatch):
+    client,headers,user_id=auth_client(); fund(user_id,1000); scrap=create_scrap(client,headers,'Protected reset')
+    monkeypatch.setenv('ADMIN_EMAILS','different-admin@example.test')
+    response=client.post(f'/admin/scraps/{scrap["id"]}/reset',headers=headers)
+    assert response.status_code==403
+    assert client.get('/scraps/current',headers=headers).json()['id']==str(uuid.UUID(scrap['id']))

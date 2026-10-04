@@ -33,3 +33,16 @@
 - Remote GitHub must be treated as release-controlled infrastructure, not as the default destination for commits.
 - If the CTO says to commit, commit locally only unless the same instruction explicitly requests a push.
 - If the CTO says to make it stable, do not push/merge unless the command explicitly authorizes the push/merge.
+
+## Progress preservation — mandatory
+
+- Treat all existing working code, UI, behavior, configuration, and documentation as protected baseline unless the CTO explicitly approves a change.
+- Before modifying code, audit the current implementation and the applicable source-of-truth documents. Never edit first based on assumptions.
+- Define the change boundary before implementation: files/components/functions affected, existing behavior that must remain unchanged, and the new behavior being added.
+- Before modifying a file, create a dated backup when practical; never overwrite or replace a working file wholesale when a surgical change is sufficient.
+- Do not redesign, refactor, rename, remove, or alter unrelated working features as part of an improvement.
+- Preserve existing UI/design and hand-built functionality unless the CTO explicitly approves a redesign.
+- Never use broad staging such as `git add .` when unrelated working-tree changes exist. Stage only the files and changes belonging to the approved task.
+- Before commit, validate the affected code, review the actual diff, and confirm unrelated changes are not included.
+- If achieving the requested improvement requires architectural changes or risks existing functionality, stop and ask the CTO for direction rather than deciding unilaterally.
+- Every improvement must be additive or surgical by default: preserve current progress first, then implement the approved change.

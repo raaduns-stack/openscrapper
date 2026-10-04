@@ -1,6 +1,12 @@
-# Scrappee Browser Import v0.6.11
+# Scrappee Browser Import v0.6.15
 
 Automatic Google/Bing SERP collection built directly on the stable v0.6.7 extraction method.
+
+## Counter state
+
+The popup **SERP CAPTURED** counter is sourced from the local `harvestedResults` collection, which is the single local source for captured SERP results. This keeps the counter synchronized for both manual **CAPTURE CURRENT** and automatic SERP collection. `serpAutoState` stores collection progress/state and is not used as the authoritative captured-result count.
+
+The **PAGE LEADS** and **PAGE INDEXER** metrics remain separate and are sourced from the last page-indexing result.
 
 ## Flow
 

@@ -2,8 +2,9 @@ from dataclasses import dataclass
 import re
 from src.models.criteria import SearchCriteria
 from src.agent.geography import GeographyResolver
+from src.search.domain_resolver import ExternalDomainResolver
 
-VARIABLES = {"industry", "product", "geography-1", "geography-2", "geography-3", "role", "keyword", "target_type"}
+VARIABLES = {"industry", "product", "geography-1", "geography-2", "geography-3", "role", "keyword", "target_type", "domain"}
 VAR_RE = re.compile(r"{([a-z0-9_-]+)}")
 
 @dataclass(frozen=True)
@@ -19,13 +20,32 @@ class TemplateParameter:
 
 class SearchTemplateEngine:
     """Expand administrator-owned search templates; never invent search logic."""
-    def __init__(self, conn, adapters):
+    def __init__(self, conn, adapters, domain_resolver=None):
         self.conn = conn
         self.adapters = adapters
         self.geography = GeographyResolver()
+        self.domain_resolver = domain_resolver if domain_resolver is not None else ExternalDomainResolver.from_env()
+        self._domain_cache = {}
 
     def _geography_values(self, value):
         return self.geography.classify_values(value)
+
+    def _expanded_roles(self, roles):
+        out=[]
+        for anchor in roles:
+            anchor=str(anchor).strip()
+            if not anchor:
+                continue
+            rows=self.conn.execute(
+                "SELECT expanded_role FROM role_expansions WHERE lower(anchor_role)=lower(%s) AND active=true ORDER BY position,created_at",
+                (anchor,)
+            ).fetchall()
+            values=[r[0] for r in rows] or [anchor]
+            for value in [anchor, *values]:
+                value=str(value).strip()
+                if value and value.casefold() not in {x.casefold() for x in out}:
+                    out.append(value)
+        return out
 
     def _values(self, criteria):
         geography = self._geography_values(criteria.geography)
@@ -35,10 +55,23 @@ class SearchTemplateEngine:
             "geography-1": geography["geography-1"],
             "geography-2": geography["geography-2"],
             "geography-3": geography["geography-3"],
-            "role": criteria.roles or [""],
+            "role": self._expanded_roles(criteria.roles),
             "keyword": criteria.keywords or [""],
             "target_type": [criteria.target_type],
         }
+
+    def _domain_values(self, criteria, resolved):
+        if not self.domain_resolver:
+            return []
+        geography = resolved.get("geography-3") or resolved.get("geography-2") or resolved.get("geography-1") or criteria.geography
+        role = resolved.get("role", "")
+        keyword = resolved.get("keyword", "")
+        cache_key = (criteria.industry.casefold(), str(geography or "").casefold(), str(role or "").casefold(), str(keyword or "").casefold())
+        if cache_key not in self._domain_cache:
+            self._domain_cache[cache_key] = self.domain_resolver.resolve(
+                industry=criteria.industry, geography=geography, role=role, keyword=keyword
+            )
+        return self._domain_cache[cache_key]
 
     def generate(self, criteria: SearchCriteria, max_queries: int|None = None):
         if max_queries is not None and max_queries < 0:
@@ -57,10 +90,18 @@ class SearchTemplateEngine:
                 continue
             combos=[{}]
             for var in dict.fromkeys(variables):
+                if var == "domain":
+                    continue
                 nxt=[]
                 for combo in combos:
                     for value in values[var]:
                         nxt.append({**combo,var:value})
+                combos=nxt
+            if "domain" in variables:
+                nxt=[]
+                for combo in combos:
+                    for value in self._domain_values(criteria, combo):
+                        nxt.append({**combo, "domain": value})
                 combos=nxt
             for resolved in combos:
                 if limit is not None and len(params) >= limit:

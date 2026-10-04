@@ -529,10 +529,11 @@ Secrets such as SMTP passwords or OAuth credentials must never be displayed.
 
 ### 7.3.11 SERP, Search Templates and Research Controls
 
-
 ### 7.3.12 Search Templates Administrator Completion — 2026-10-02
 
-The Search Templates page exposes category and template configuration as a persistent administrator workflow. Categories and templates support priority ordering through move-up/move-down controls; category active state is editable; built-in categories remain protected from deletion while custom categories are deletable; template variable validation follows the deterministic template engine grammar; and the UI shows active-template capacity. Existing CRUD, rename, provider filtering, geography variables, and database persistence remain unchanged.
+The Search Templates page exposes category and template configuration as a persistent administrator workflow. Categories and templates support priority ordering through move-up/move-down controls; category active state is editable; every category is deletable through a confirmation-gated control; template variable validation follows the deterministic template engine grammar; and the UI shows active-template capacity. Existing CRUD, rename, provider filtering, geography variables, and database persistence remain unchanged.
+
+The Create Template editor also exposes `{domain}` as an approved derived variable. `{domain}` is resolved from the external client database during deterministic search generation; it is not a manually managed domain list.
 
 
 Existing admin-backed controls include:
@@ -644,3 +645,29 @@ The Admin React implementation must distinguish three states:
 3. **Approved target capability not currently backed by the server** — document and engineer the backend contract first; do not fabricate client-side state or authorization.
 
 No Admin feature may be represented as operationally complete until its server-side authorization, persistence semantics, and failure paths are validated.
+
+### 7.3.14 Search Template builder visual polish — 2026-10-03
+
+The Search Templates Create Template surface uses a builder-style visual hierarchy: editor header, horizontally scrollable variable library, structured provider/family/template/state controls, validation, example preview, and capacity status. Category deletion is always visible and confirmation-gated for every category. This does not alter backend persistence semantics.
+
+### 7.3.13 Create Template editor improvements — 2026-10-03
+
+The Search Templates Create Template editor provides click-to-insert approved variables, inline variable validation, an illustrative example preview, existing-family suggestions, explicit state selection, and responsive form layout. `{domain}` is presented as externally derived. These are UX improvements only; the database model and deterministic search-template expansion contract remain unchanged.
+
+### 7.3.15 Search Template builder structural editor + family selector fix — 2026-10-03
+- Create/Edit Template uses a three-zone builder layout: variable library, pattern editor, and live-check/save rail.
+- Existing CRUD, ordering, state, validation, cursor insertion, capacity display, and category controls are preserved.
+- Family is a native select populated from the active category's families, with a Custom family option that exposes the free-text field for new family names.
+- Category delete remains visible for every category.
+
+
+### 7.3.16 Search Template library table redesign — 2026-10-03
+The Search Templates library uses a configuration-oriented table hierarchy: Search Pattern, Provider, Family, Status, and Actions. Edit and ordering remain visible; Enable/Disable and Delete are grouped under an overflow menu to reduce row clutter. Provider badges, status dots, hover treatment, controlled monospace pattern display, and responsive layouts are visual-only. Existing category/template CRUD, ordering, state changes, filtering, persistence, validation, and builder behavior are preserved.
+
+
+### 7.3.17 Category deletion policy correction — 2026-10-03
+CTO clarified that every Search Template category must expose a delete icon, including categories carrying a stable/built-in key. Deletion remains confirmation-gated and uses the existing category DELETE endpoint; database cascade removes templates belonging to the deleted category. The stable_key field remains for identity/seed compatibility and no longer controls UI/API deletion permission.
+
+
+### 7.3.18 Published family selector correction — 2026-10-03
+The Create/Edit Template editor exposes exactly one Family control: a native dropdown populated dynamically from active/published Template Family names in the database's category records, ordered by published position. The frontend contains no hardcoded family list, category-scoped suggestion logic, or Custom family free-text path.

@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
-import asyncio, secrets, time, uuid, os, math, logging, re, subprocess, smtplib, ssl, base64, threading
+import asyncio, secrets, time, uuid, os, math, logging, re, subprocess, smtplib, ssl, base64
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
@@ -43,6 +43,20 @@ async def lifespan(_app):
     yield
 
 app=FastAPI(title="Scrappee API", lifespan=lifespan)
+
+@app.get('/public/pricing')
+def public_pricing():
+    with db() as conn:
+        rows=conn.execute("SELECT key,value FROM app_settings WHERE key IN ('scrap_creation_price_cents','premium_serp_price_cents','paid_enrichment_unit_micros_usd','page_indexer_price_cents')").fetchall()
+    values={r[0]:int(r[1]) for r in rows}
+    return {
+        'scrap_creation_price_cents': values.get('scrap_creation_price_cents',0),
+        'premium_serp_price_cents': values.get('premium_serp_price_cents',0),
+        'paid_enrichment_unit_micros_usd': values.get('paid_enrichment_unit_micros_usd',0),
+        'page_indexer_price_cents': values.get('page_indexer_price_cents',0),
+        'minimum_deposit_cents': MIN_DEPOSIT_CENTS,
+    }
+
 app.add_middleware(CORSMiddleware, allow_origins=["https://scrapee.uk"], allow_origin_regex=r"^chrome-extension://[a-p]{32}$", allow_credentials=False, allow_methods=["GET","POST","DELETE","OPTIONS"], allow_headers=["Authorization","Content-Type","X-Scrap-Id","X-Scrappee-Extension"])
 init_db()
 purge_expired_history()
@@ -126,9 +140,28 @@ class DomainRuleRequest(BaseModel):
     rule_type: Literal["blacklist", "whitelist"]
 
 class ScrapRequest(BaseModel):
-    name: str=Field(default="Current Scrap",min_length=1,max_length=200)
+    name: str=Field(default="",max_length=200)
     criteria: dict = Field(default_factory=dict)
     crawler: CrawlerConfig = Field(default_factory=CrawlerConfig)
+
+def derive_scrap_name(criteria: dict, requested_name: str | None = None) -> str:
+    requested=(requested_name or "").strip()
+    if requested and requested.lower() != "current scrap":
+        return requested[:200]
+    roles=criteria.get("roles") or []
+    role_text=", ".join(str(x).strip() for x in roles if str(x).strip())
+    geography=str(criteria.get("geography") or "").strip()
+    product=str(criteria.get("product") or "").strip()
+    industry=str(criteria.get("industry") or "").strip()
+    target=str(criteria.get("target_type") or "people").strip().lower()
+    subject=role_text or product or (industry if industry.lower() not in {"general","unknown"} else "")
+    if subject and geography:
+        return f"{subject} leads in {geography}"[:200]
+    if subject:
+        return f"{subject} leads"[:200]
+    if geography:
+        return f"{('Companies' if target == 'companies' else 'Leads')} in {geography}"[:200]
+    return "Research Scrap"
 
 class AdminBulkDeleteUsersRequest(BaseModel):
     user_ids: list[str] = Field(min_length=1,max_length=200)
@@ -729,6 +762,7 @@ def create_scrap(request: ScrapRequest, req: Request):
         max_leads_limit=int(conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_max_leads'").fetchone()[0])
         timeout_hours=int(conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_timeout_hours'").fetchone()[0])
         criteria=dict(request.criteria or {})
+        scrap_name=derive_scrap_name(criteria, request.name)
         requested_max_leads=int(criteria.get("max_leads", default_max_leads))
         if requested_max_leads < 1 or requested_max_leads > max_leads_limit: raise HTTPException(422, f"Maximum leads must be between 1 and {max_leads_limit}")
         criteria["max_leads"]=requested_max_leads
@@ -740,9 +774,9 @@ def create_scrap(request: ScrapRequest, req: Request):
         conn.execute("UPDATE wallets SET balance_cents=balance_cents-%s,updated_at=now() WHERE user_id=%s",(price,uid))
         new_balance=balance-price
         conn.execute("INSERT INTO wallet_transactions(id,user_id,amount_cents,balance_after_cents,transaction_type,reference_id) VALUES(%s,%s,%s,%s,'scrap_creation',%s)",(uuid.uuid4(),uid,-price,new_balance,scrap_id))
-        conn.execute("INSERT INTO scraps(id,user_id,name,criteria,crawler_config) VALUES(%s,%s,%s,%s,%s)",(uuid.UUID(scrap_id),uid,request.name,Jsonb(criteria),Jsonb(crawler_data)))
+        conn.execute("INSERT INTO scraps(id,user_id,name,criteria,crawler_config) VALUES(%s,%s,%s,%s,%s)",(uuid.UUID(scrap_id),uid,scrap_name,Jsonb(criteria),Jsonb(crawler_data)))
         conn.commit()
-    return {"id":scrap_id,"name":request.name,"status":"active","charged_cents":price,"balance_cents":new_balance}
+    return {"id":scrap_id,"name":scrap_name,"status":"active","charged_cents":price,"balance_cents":new_balance}
 
 class WalletAdjustmentRequest(BaseModel):
     user_email: str
@@ -786,6 +820,61 @@ def admin_scraps(req: Request, page: int = 1, page_size: int = 50, status: str =
         off=(page-1)*page_size
         rows=conn.execute("SELECT s.id,s.name,s.status,s.created_at,s.completed_at,u.email,(SELECT count(*) FROM leads l WHERE l.scrap_id=s.id),(SELECT count(*) FROM serp_results sr WHERE sr.scrap_id=s.id) FROM scraps s JOIN users u ON u.id=s.user_id"+where+" ORDER BY s.created_at DESC LIMIT %s OFFSET %s",tuple(params+[page_size,off])).fetchall()
     return {"scraps":[{"id":str(r[0]),"name":r[1],"status":r[2],"created_at":r[3].isoformat(),"completed_at":r[4].isoformat() if r[4] else None,"user_email":r[5],"leads":int(r[6]),"serp_results":int(r[7])} for r in rows],"total":total,"page":page,"page_size":page_size,"total_pages":(total+page_size-1)//page_size}
+
+
+@app.post("/admin/scraps/{scrap_id}/reset")
+def admin_reset_scrap(scrap_id: str, req: Request, background_tasks: BackgroundTasks):
+    admin = current_user(req)
+    if not _is_admin(admin): raise HTTPException(403, "Admin access required")
+    try: sid = uuid.UUID(scrap_id)
+    except ValueError: raise HTTPException(422, "Invalid Scrap id")
+    stored_files=[]; preserved=[]; canceled_jobs=[]
+    with db() as conn:
+        scrap=conn.execute("SELECT id,user_id,name,status FROM scraps WHERE id=%s FOR UPDATE",(sid,)).fetchone()
+        if not scrap: raise HTTPException(404,"Scrap not found")
+        uid=uuid.UUID(str(scrap[1])); customer=conn.execute("SELECT email FROM users WHERE id=%s",(uid,)).fetchone()
+        existing=conn.execute("SELECT 1 FROM wallet_transactions WHERE user_id=%s AND transaction_type='scrap_reset_refund' AND reference_id=%s",(uid,str(sid))).fetchone()
+        if existing: raise HTTPException(409,"Scrap reset has already been processed")
+        jobs=conn.execute("SELECT id FROM jobs WHERE scrap_id=%s AND status IN ('queued','running','processing')",(sid,)).fetchall()
+        for (jid,) in jobs:
+            CANCEL_FLAGS.add(str(jid)); canceled_jobs.append(str(jid))
+            conn.execute("UPDATE jobs SET status='canceled',stage='Canceled',result=result || %s,updated_at=now() WHERE id=%s",(Jsonb({"message":"Scrap reset by administrator"}),jid))
+        files=conn.execute("SELECT location FROM exports WHERE scrap_id=%s AND format IN ('csv','xlsx') AND location IS NOT NULL",(sid,)).fetchall()
+        stored_files=[str(r[0]) for r in files]
+        refund=conn.execute("""
+            SELECT COALESCE(SUM(wt.amount_cents),0) FROM wallet_transactions wt
+            WHERE wt.user_id=%s AND (
+              (wt.transaction_type='scrap_creation' AND replace(wt.reference_id,'-','')=replace(%s,'-',''))
+              OR (wt.transaction_type IN ('premium_serp_extraction','premium_serp_refund') AND wt.reference_id IN (SELECT id::text FROM premium_serp_extractions WHERE scrap_id=%s))
+              OR (wt.transaction_type IN ('paid_enrichment','paid_enrichment_no_provider','page_indexer','page_indexer_refund') AND split_part(wt.reference_id,':',1) IN (SELECT id::text FROM jobs WHERE scrap_id=%s))
+            )
+        """,(uid,str(sid),sid,sid)).fetchone()[0]
+        refund_cents=max(0,-int(refund or 0))
+        wallet=conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s FOR UPDATE",(uid,)).fetchone()
+        if not wallet: raise HTTPException(500,"Wallet not initialized")
+        completed=conn.execute("SELECT id FROM leads WHERE scrap_id=%s AND status='completed' FOR UPDATE",(sid,)).fetchall()
+        preserved=[str(r[0]) for r in completed]
+        if preserved:
+            conn.execute("UPDATE leads SET user_id=%s,scrap_id=NULL WHERE scrap_id=%s AND status='completed'",(uid,sid))
+        campaign_rows=conn.execute("SELECT id,config FROM sender_campaigns WHERE user_id=%s AND config->'audience'->>'scrap_id'=%s",(uid,str(sid))).fetchall()
+        for cid,config in campaign_rows:
+            for lid in preserved: conn.execute("INSERT INTO sender_campaign_leads(campaign_id,lead_id,user_id) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",(cid,uuid.UUID(lid),uid))
+            conn.execute("UPDATE sender_campaigns SET config=config-'audience',updated_at=now() WHERE id=%s",(cid,))
+        new_balance=int(wallet[0])+refund_cents
+        conn.execute("UPDATE wallets SET balance_cents=%s,updated_at=now() WHERE user_id=%s",(new_balance,uid))
+        conn.execute("INSERT INTO wallet_transactions(id,user_id,amount_cents,balance_after_cents,transaction_type,reference_id) VALUES(%s,%s,%s,%s,'scrap_reset_refund',%s)",(uuid.uuid4(),uid,refund_cents,new_balance,str(sid)))
+        _audit(conn,admin["id"],"scrap_reset","scraps",uid,{"scrap_id":str(sid),"scrap_name":scrap[2],"previous_status":scrap[3],"refunded_cents":refund_cents,"preserved_completed_leads":len(preserved),"canceled_jobs":len(canceled_jobs),"stored_files":len(stored_files)})
+        conn.execute("DELETE FROM serp_sessions WHERE scrap_id=%s",(sid,))
+        conn.execute("DELETE FROM scraps WHERE id=%s AND user_id=%s",(sid,uid))
+        conn.commit()
+    for path in stored_files:
+        try:
+            output=Path(path)
+            if output.exists() and output.is_file() and output.resolve().parent == Path('output').resolve(): output.unlink()
+        except Exception: logging.exception("Failed to remove Scrap export file %s",path)
+    if customer and customer[0] and refund_cents:
+        background_tasks.add_task(_send_wallet_adjustment_email,customer[0],refund_cents,f"Scrap reset: {scrap[2]}",new_balance)
+    return {"scrap_id":str(sid),"status":"reset","refunded_cents":refund_cents,"preserved_completed_leads":len(preserved),"canceled_jobs":canceled_jobs}
 
 @app.get("/admin/campaigns")
 def admin_campaigns(req: Request, status: str = "", search: str = ""):
@@ -882,6 +971,54 @@ def admin_premium_provider(provider: str, request: AdminPremiumProviderRequest, 
     except ValueError as exc: raise HTTPException(422,str(exc)) from exc
     return next(x for x in provider_statuses() if x["provider"]==provider)
 
+@app.get("/admin/role-expansions")
+def admin_role_expansions(req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        rows=conn.execute("SELECT id,anchor_role,expanded_role,active,position FROM role_expansions ORDER BY anchor_role,position,created_at").fetchall()
+    return [{"id":str(r[0]),"anchor_role":r[1],"expanded_role":r[2],"active":r[3],"position":r[4]} for r in rows]
+
+@app.post("/admin/role-expansions")
+def admin_add_role_expansion(request: dict, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    anchor=str(request.get("anchor_role") or "").strip()
+    expanded=str(request.get("expanded_role") or "").strip()
+    if not anchor or not expanded: raise HTTPException(422,"Anchor role and expanded role are required")
+    with db() as conn:
+        try:
+            row=conn.execute("INSERT INTO role_expansions(id,anchor_role,expanded_role,active,position) VALUES(gen_random_uuid(),lower(%s),%s,%s,(SELECT COALESCE(MAX(position),0)+1 FROM role_expansions WHERE lower(anchor_role)=lower(%s))) RETURNING id,anchor_role,expanded_role,active,position",(anchor,expanded,bool(request.get("active",True)),anchor)).fetchone(); conn.commit()
+        except UniqueViolation as exc:
+            raise HTTPException(409,"Role expansion already exists") from exc
+    return {"id":str(row[0]),"anchor_role":row[1],"expanded_role":row[2],"active":row[3],"position":row[4]}
+
+@app.patch("/admin/role-expansions/{expansion_id}")
+def admin_patch_role_expansion(expansion_id: str, request: dict, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    eid=uuid.UUID(expansion_id)
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM role_expansions WHERE id=%s",(eid,)).fetchone(): raise HTTPException(404,"Role expansion not found")
+        if "anchor_role" in request:
+            anchor=str(request["anchor_role"]).strip()
+            if not anchor: raise HTTPException(422,"Anchor role cannot be empty")
+            conn.execute("UPDATE role_expansions SET anchor_role=lower(%s) WHERE id=%s",(anchor,eid))
+        if "expanded_role" in request:
+            expanded=str(request["expanded_role"]).strip()
+            if not expanded: raise HTTPException(422,"Expanded role cannot be empty")
+            conn.execute("UPDATE role_expansions SET expanded_role=%s WHERE id=%s",(expanded,eid))
+        if "active" in request: conn.execute("UPDATE role_expansions SET active=%s WHERE id=%s",(bool(request["active"]),eid))
+        conn.commit()
+    return {"id":expansion_id}
+
+@app.delete("/admin/role-expansions/{expansion_id}",status_code=204)
+def admin_delete_role_expansion(expansion_id: str, req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        conn.execute("DELETE FROM role_expansions WHERE id=%s",(uuid.UUID(expansion_id),)); conn.commit()
+
 @app.get("/admin/search-template-categories")
 def admin_search_template_categories(req: Request):
     user=current_user(req)
@@ -902,6 +1039,14 @@ def admin_add_search_template_category(request: SearchTemplateCategoryRequest, r
             raise HTTPException(409,"Category already exists") from exc
     return {"id":str(row[0]),"name":row[1],"active":row[2],"position":row[3]}
 
+@app.get("/admin/search-template-families")
+def admin_search_template_families(req: Request):
+    user=current_user(req)
+    if not _is_admin(user): raise HTTPException(403,"Admin access required")
+    with db() as conn:
+        rows=conn.execute("SELECT name FROM search_template_categories WHERE active=true AND name IS NOT NULL AND btrim(name)<>'' ORDER BY position,name").fetchall()
+    return [r[0] for r in rows]
+
 @app.get("/admin/search-template-categories/{category_id}/templates")
 def admin_search_templates(category_id: str, req: Request):
     user=current_user(req)
@@ -914,7 +1059,7 @@ def admin_search_templates(category_id: str, req: Request):
 def admin_add_search_template(request: SearchTemplateRequest, req: Request):
     user=current_user(req)
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
-    if any(v not in VARIABLES for v in __import__("re").findall(r"{([a-z_]+)}",request.template)):
+    if any(v not in VARIABLES for v in __import__("re").findall(r"{([a-z0-9_-]+)}",request.template)):
         raise HTTPException(422,"Template contains an unsupported variable")
     with db() as conn:
         category_id=uuid.UUID(request.category_id)
@@ -953,7 +1098,7 @@ def admin_patch_search_template(template_id: str, request: dict, req: Request):
         if "template" in request:
             template=str(request["template"]).strip()
             if not template: raise HTTPException(422,"Template cannot be empty")
-            if any(v not in VARIABLES for v in __import__("re").findall(r"{([a-z_]+)}",template)): raise HTTPException(422,"Template contains an unsupported variable")
+            if any(v not in VARIABLES for v in __import__("re").findall(r"{([a-z0-9_-]+)}",template)): raise HTTPException(422,"Template contains an unsupported variable")
             conn.execute("UPDATE search_templates SET template=%s WHERE id=%s",(template,tid))
         if "position" in request:
             target=max(0,int(request["position"]))
@@ -994,9 +1139,8 @@ def admin_delete_search_template_category(category_id: str, req: Request):
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
     cid=uuid.UUID(category_id)
     with db() as conn:
-        row=conn.execute("SELECT stable_key FROM search_template_categories WHERE id=%s",(cid,)).fetchone()
+        row=conn.execute("SELECT id FROM search_template_categories WHERE id=%s",(cid,)).fetchone()
         if not row: raise HTTPException(404,"Search template category not found")
-        if row[0]: raise HTTPException(409,"Built-in categories cannot be deleted")
         conn.execute("DELETE FROM search_template_categories WHERE id=%s",(cid,))
         conn.commit()
     return {"deleted": True, "id": category_id}
@@ -1545,6 +1689,27 @@ class WorkstationLeadSelection(BaseModel):
     lead_ids: list[str] = Field(default_factory=list)
 
 
+@app.get("/scraps/current/workstation")
+def current_workstation(req: Request):
+    user = current_user(req); uid = uuid.UUID(user["id"])
+    with db() as conn:
+        current = conn.execute("SELECT id,name,status FROM scraps WHERE user_id=%s AND status IN ('active','running') ORDER BY created_at DESC LIMIT 1",(uid,)).fetchone()
+        if not current: return None
+        sid = current[0]
+        leads_rows = conn.execute("SELECT id,data,status,approved_at,approved_by,created_at FROM leads WHERE scrap_id=%s ORDER BY created_at,id",(sid,)).fetchall()
+        source_counts = conn.execute("SELECT lead_id,count(*) FROM lead_sources WHERE lead_id = ANY(%s) GROUP BY lead_id",([row[0] for row in leads_rows],)).fetchall() if leads_rows else []
+        balance = conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s",(uid,)).fetchone()[0]
+        price = conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='scrap_creation_price_cents'").fetchone()[0]
+        premium_price = conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='premium_serp_price_cents'").fetchone()[0]
+        paid_unit = conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='paid_enrichment_unit_micros_usd'").fetchone()[0]
+        page_indexer_price = conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='page_indexer_price_cents'").fetchone()[0]
+        default_max_leads = conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_default_max_leads'").fetchone()[0]
+        max_leads = conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_max_leads'").fetchone()[0]
+        timeout_hours = conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_timeout_hours'").fetchone()[0]
+    source_count_by_lead = {str(row[0]): int(row[1]) for row in source_counts}
+    leads = [{"id":str(row[0]),"data":row[1],"status":row[2],"approved_at":row[3].isoformat() if row[3] else None,"approved_by":str(row[4]) if row[4] else None,"created_at":row[5].isoformat(),"source_count":source_count_by_lead.get(str(row[0]),0)} for row in leads_rows]
+    return {"scrap":{"id":str(current[0]),"name":current[1],"status":current[2]},"leads":leads,"counts":{"total":len(leads),"working":sum(x["status"]=="working" for x in leads),"completed":sum(x["status"]=="completed" for x in leads)},"billing":{"balance_cents":int(balance),"scrap_creation_price_cents":int(price),"premium_serp_price_cents":int(premium_price),"paid_enrichment_unit_micros_usd":int(paid_unit),"page_indexer_price_cents":int(page_indexer_price),"research_default_max_leads":int(default_max_leads),"research_max_leads":int(max_leads),"research_timeout_hours":int(timeout_hours)}}
+
 @app.get("/scraps/{scrap_id}/workstation")
 def lead_workstation(scrap_id: str, req: Request):
     user = current_user(req)
@@ -1557,22 +1722,15 @@ def lead_workstation(scrap_id: str, req: Request):
             "SELECT id,data,status,approved_at,approved_by,created_at FROM leads WHERE scrap_id=%s ORDER BY created_at,id",
             (sid,),
         ).fetchall()
-        source_rows = conn.execute(
-            "SELECT ls.lead_id,e.id,e.source_type,e.data,e.created_at "
-            "FROM lead_sources ls JOIN evidence e ON e.id=ls.evidence_id "
-            "WHERE ls.lead_id = ANY(%s) ORDER BY e.created_at DESC",
+        source_counts = conn.execute(
+            "SELECT lead_id,count(*) FROM lead_sources WHERE lead_id = ANY(%s) GROUP BY lead_id",
             ([row[0] for row in rows],),
         ).fetchall() if rows else []
-    sources_by_lead = {}
-    for row in source_rows:
-        sources_by_lead.setdefault(str(row[0]), []).append({
-            "id": str(row[1]), "source_type": row[2], "data": row[3],
-            "created_at": row[4].isoformat(),
-        })
+    source_count_by_lead = {str(row[0]): int(row[1]) for row in source_counts}
     leads = [
         {"id": str(row[0]), "data": row[1], "status": row[2], "approved_at": row[3].isoformat() if row[3] else None,
          "approved_by": str(row[4]) if row[4] else None, "created_at": row[5].isoformat(),
-         "sources": sources_by_lead.get(str(row[0]), [])}
+         "source_count": source_count_by_lead.get(str(row[0]), 0)}
         for row in rows
     ]
     return {
@@ -1581,6 +1739,14 @@ def lead_workstation(scrap_id: str, req: Request):
         "counts": {"total": len(leads), "working": sum(x["status"] == "working" for x in leads), "completed": sum(x["status"] == "completed" for x in leads)},
     }
 
+@app.get("/scraps/{scrap_id}/leads/{lead_id}/sources")
+def workstation_lead_sources(scrap_id: str, lead_id: str, req: Request):
+    user = current_user(req); sid = uuid.UUID(scrap_id); lid = uuid.UUID(lead_id)
+    with db() as conn:
+        owned = conn.execute("SELECT 1 FROM leads l JOIN scraps s ON s.id=l.scrap_id WHERE l.id=%s AND l.scrap_id=%s AND s.user_id=%s",(lid,sid,uuid.UUID(user["id"]))).fetchone()
+        if not owned: raise HTTPException(404,"Lead not found")
+        rows = conn.execute("SELECT e.id,e.source_type,e.data,e.created_at FROM lead_sources ls JOIN evidence e ON e.id=ls.evidence_id WHERE ls.lead_id=%s ORDER BY e.created_at DESC",(lid,)).fetchall()
+    return [{"id":str(row[0]),"source_type":row[1],"data":row[2],"created_at":row[3].isoformat()} for row in rows]
 
 @app.patch("/scraps/{scrap_id}/leads/{lead_id}")
 def update_workstation_lead(scrap_id: str, lead_id: str, request: WorkstationLeadUpdate, req: Request):
@@ -1613,12 +1779,11 @@ def delete_workstation_lead(scrap_id: str, lead_id: str, req: Request):
     user = current_user(req)
     sid = uuid.UUID(scrap_id); lid = uuid.UUID(lead_id)
     with db() as conn:
-        owned = conn.execute(
-            "SELECT 1 FROM leads l JOIN scraps s ON s.id=l.scrap_id WHERE l.id=%s AND l.scrap_id=%s AND s.user_id=%s",
-            (lid, sid, uuid.UUID(user["id"])),
-        ).fetchone()
-        if not owned:
+        row = conn.execute("SELECT status FROM leads l JOIN scraps s ON s.id=l.scrap_id WHERE l.id=%s AND l.scrap_id=%s AND s.user_id=%s", (lid, sid, uuid.UUID(user["id"]))).fetchone()
+        if not row:
             raise HTTPException(404, "Lead not found")
+        if row[0] == "completed":
+            raise HTTPException(409, "Completed Leads cannot be deleted")
         conn.execute("DELETE FROM leads WHERE id=%s AND scrap_id=%s", (lid, sid)); conn.commit()
 
 
@@ -1649,9 +1814,10 @@ def approve_workstation_leads(scrap_id: str, request: WorkstationLeadSelection, 
         owned = conn.execute("SELECT 1 FROM scraps WHERE id=%s AND user_id=%s", (sid, uid)).fetchone()
         if not owned:
             raise HTTPException(404, "Scrap not found")
-        conn.execute("UPDATE leads SET status='completed',approved_at=now(),approved_by=%s WHERE scrap_id=%s AND id=ANY(%s) AND status='working'", (uid, sid, lead_ids))
+        cursor=conn.execute("UPDATE leads SET status='completed',approved_at=now(),approved_by=%s WHERE scrap_id=%s AND id=ANY(%s) AND status='working'", (uid, sid, lead_ids))
+        approved=cursor.rowcount
         conn.commit()
-    return {"approved": len(lead_ids)}
+    return {"approved": approved}
 
 
 @app.post("/scraps/{scrap_id}/enrich", status_code=202)
@@ -1732,8 +1898,16 @@ def scrap_url_occurrences(scrap_id: str, req: Request):
 def list_scraps(req: Request):
     user=current_user(req)
     with db() as conn:
-        rows=conn.execute("SELECT id,name,status,created_at,completed_at FROM scraps WHERE user_id=%s ORDER BY created_at DESC",(uuid.UUID(user["id"]),)).fetchall()
-    return [{"id":str(r[0]),"name":r[1],"status":r[2],"created_at":r[3].isoformat(),"completed_at":r[4].isoformat() if r[4] else None} for r in rows]
+        rows=conn.execute("""
+            SELECT s.id,s.name,s.status,s.created_at,s.completed_at,
+                   (SELECT count(*) FROM serp_results x WHERE x.scrap_id=s.id),
+                   (SELECT count(*) FROM url_occurrences x WHERE x.scrap_id=s.id),
+                   (SELECT count(*) FROM leads x WHERE x.scrap_id=s.id)
+            FROM scraps s
+            WHERE s.user_id=%s
+            ORDER BY s.created_at DESC
+        """,(uuid.UUID(user["id"]),)).fetchall()
+    return [{"id":str(r[0]),"name":r[1],"status":r[2],"created_at":r[3].isoformat(),"completed_at":r[4].isoformat() if r[4] else None,"counts":{"serp_results":int(r[5]),"url_occurrences":int(r[6]),"leads":int(r[7])}} for r in rows]
 
 @app.delete("/scraps/{scrap_id}",status_code=204)
 def delete_scrap(scrap_id: str, req: Request):
@@ -2219,30 +2393,8 @@ def _increment_llm_calls(scrap_id: str):
         conn.commit()
 
 
-_SERP_LEAD_PROCESS_LOCK = threading.Lock()
-
-def _process_serp_leads_background(scrap_id: str, records: list[dict]):
-    # SERP imports can arrive faster than contextual lead extraction completes.
-    # Keep this expensive pipeline single-flight so multiple concurrent requests
-    # cannot instantiate duplicate extractor/model state and exhaust API memory.
-    with _SERP_LEAD_PROCESS_LOCK:
-        try:
-            with db() as conn:
-                row = conn.execute("SELECT user_id,criteria,crawler_config FROM scraps WHERE id=%s", (uuid.UUID(scrap_id),)).fetchone()
-            if not row:
-                return
-            user_id, raw_criteria, raw_crawler = row
-            criteria = SearchCriteria.model_validate(raw_criteria or {})
-            crawler = CrawlerConfig.model_validate(raw_crawler or {})
-            prefixes, rules = get_client_policies(str(user_id))
-            pipeline = LeadDiscoveryPipeline(crawler_config=crawler, generic_prefixes=prefixes, domain_rules=rules, llm_call_counter=lambda: _increment_llm_calls(scrap_id))
-            asyncio.run(pipeline.process_serp_records(criteria, records, scrap_id=scrap_id))
-        except Exception as exc:
-            print(f"serp_lead_processing_error={scrap_id}: {type(exc).__name__}: {exc}")
-
-
 @app.post("/serp/import")
-def import_serp_urls(request: SerpImportRequest, req: Request, background_tasks: BackgroundTasks):
+def import_serp_urls(request: SerpImportRequest, req: Request):
     auth=req.headers.get("Authorization")
     user=current_user(req) if auth else None
     session=_serp_session(request.token,user["id"] if user else None)
@@ -2268,8 +2420,10 @@ def import_serp_urls(request: SerpImportRequest, req: Request, background_tasks:
         conn.execute("UPDATE serp_sessions SET urls=%s,results=%s,imports=%s WHERE token=%s",(Jsonb(session["urls"]),Jsonb(session["results"]),Jsonb(session["imports"]),request.token))
         conn.commit()
     if new_results and session.get("scrap_id"):
-        background_tasks.add_task(_process_serp_leads_background, session["scrap_id"], new_results)
-    return {"count":len(urls),"results":len(results),"new_results":len(new_results),"total":len(session["urls"]),"page_url":request.page_url}
+        with db() as conn:
+            conn.execute("INSERT INTO serp_lead_queue(id,scrap_id,records,status) VALUES(%s,%s,%s,'queued')",(uuid.uuid4(),uuid.UUID(session["scrap_id"]),Jsonb(new_results)))
+            conn.commit()
+    return {"count":len(urls),"results":len(results),"new_results":len(new_results),"total":len(session["urls"]),"page_url":request.page_url,"lead_processing":"queued" if new_results and session.get("scrap_id") else "none"}
 
 def _persist_job(job_id, **fields):
     with db() as conn:

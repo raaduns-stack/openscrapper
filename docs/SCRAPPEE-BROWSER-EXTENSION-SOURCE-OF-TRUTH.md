@@ -68,6 +68,8 @@ The extension workflow is intentionally simple and must not be redesigned withou
 - Sync must not require the user to switch to the Scrappee web UI first.
 - Sync must preserve the captured result data and associate it with the authenticated user's current Scrap.
 - Sync is idempotent for already-synchronized captured occurrences; repeated Sync must not create duplicate SERP rows.
+- SERP imports MUST return after database persistence and queue lead processing; the API request MUST NOT execute contextual lead extraction inline.
+- SERP lead extraction MUST run through the bounded `scrapee-serp-worker` queue with concurrency=1, retry limits, stale-job recovery, and independent service resource limits. This prevents lead extraction from blocking browser pagination or taking down the API process.
 
 ## UI — LOCKED
 
@@ -159,6 +161,7 @@ The popup MUST separate the two acquisition workflows while keeping the shared r
   - **SERP Captured** — Google/Bing search results captured for the Current Scrap.
   - **Page Leads** — leads produced by the most recent Page Lead Indexer operation.
   - **Page Indexer** — charge for the most recent indexed page.
+- **SERP Captured source:** the popup counter MUST use the local captured-result collection (`harvestedResults`) as its authoritative count for both manual capture and automatic SERP collection. Automatic collection state (`serpAutoState`) is progress/state metadata and MUST NOT be the authoritative UI count.
 - The three metrics MUST appear together at the top and MUST NOT be duplicated lower in the popup.
 
 ### Tabs

@@ -229,13 +229,13 @@ def delete_letter(user_id,letter_id):
 def available_leads(user_id):
     with db() as conn:
         rows=conn.execute("""
-            SELECT l.id,l.scrap_id,l.data,l.status,s.name
-            FROM leads l JOIN scraps s ON s.id=l.scrap_id
-            WHERE s.user_id=%s AND l.status='completed'
+            SELECT l.id,l.scrap_id,l.data,l.status,COALESCE(s.name,'Archived Leads')
+            FROM leads l LEFT JOIN scraps s ON s.id=l.scrap_id
+            WHERE (s.user_id=%s OR l.user_id=%s) AND l.status='completed'
             ORDER BY l.created_at DESC
             LIMIT 500
-        """,(user_id,)).fetchall()
-    return [{"id":str(r[0]),"scrap_id":str(r[1]),"data":r[2],"status":r[3],"scrap_name":r[4]} for r in rows]
+        """,(user_id,user_id)).fetchall()
+    return [{"id":str(r[0]),"scrap_id":str(r[1]) if r[1] else None,"data":r[2],"status":r[3],"scrap_name":r[4]} for r in rows]
 
 def campaign_audiences(user_id):
     with db() as conn:
@@ -303,9 +303,9 @@ def create_campaign(user_id,payload):
             try: lead_uuid=[uuid.UUID(x) for x in lead_ids]
             except ValueError as exc: raise ValueError("Invalid Lead id") from exc
             rows=conn.execute("""
-                SELECT l.id FROM leads l JOIN scraps s ON s.id=l.scrap_id
-                WHERE s.user_id=%s AND l.id=ANY(%s) AND l.status='completed'
-            """,(user_id,lead_uuid)).fetchall()
+                SELECT l.id FROM leads l LEFT JOIN scraps s ON s.id=l.scrap_id
+                WHERE (s.user_id=%s OR l.user_id=%s) AND l.id=ANY(%s) AND l.status='completed'
+            """,(user_id,user_id,lead_uuid)).fetchall()
             valid={str(r[0]) for r in rows}
             if len(valid)!=len(lead_uuid): raise ValueError("All selected Leads must belong to the authenticated user and be completed")
             conn.executemany("INSERT INTO sender_campaign_leads(campaign_id,lead_id,user_id) VALUES(%s,%s,%s)",[(campaign_id,x,user_id) for x in lead_uuid])
@@ -326,9 +326,9 @@ def campaign_leads(user_id,campaign_id):
             """,(scrap_id,user_id)).fetchall()
         else:
             rows=conn.execute("""
-                SELECT l.id,l.scrap_id,l.data,l.status,s.name
+                SELECT l.id,l.scrap_id,l.data,l.status,COALESCE(s.name,'Archived Leads')
                 FROM sender_campaign_leads cl JOIN leads l ON l.id=cl.lead_id
-                JOIN scraps s ON s.id=l.scrap_id
+                LEFT JOIN scraps s ON s.id=l.scrap_id
                 WHERE cl.user_id=%s AND cl.campaign_id=%s ORDER BY cl.created_at LIMIT 50
             """,(user_id,campaign_id)).fetchall()
     return [{"id":str(r[0]),"scrap_id":str(r[1]),"data":r[2],"status":r[3],"scrap_name":r[4]} for r in rows]
@@ -354,8 +354,9 @@ def send_test_lead(user_id, campaign_id, lead_id):
             JOIN sender_accounts s ON s.id=c.sender_id
             JOIN sender_letters le ON le.id=c.letter_id
             JOIN leads l ON l.id=%s AND l.status='completed'
-            JOIN scraps ls ON ls.id=l.scrap_id AND ls.user_id=c.user_id
+            LEFT JOIN scraps ls ON ls.id=l.scrap_id
             WHERE c.id=%s AND c.user_id=%s
+              AND (ls.user_id=c.user_id OR l.user_id=c.user_id)
               AND (
                 EXISTS (SELECT 1 FROM sender_campaign_leads cl WHERE cl.campaign_id=c.id AND cl.user_id=c.user_id AND cl.lead_id=l.id)
                 OR (

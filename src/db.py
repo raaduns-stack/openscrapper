@@ -146,6 +146,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_search_template_categories_stable_key ON se
 CREATE TABLE IF NOT EXISTS search_templates (
  id UUID PRIMARY KEY, category_id UUID NOT NULL REFERENCES search_template_categories(id) ON DELETE CASCADE, provider TEXT NOT NULL CHECK(provider IN ('google','bing')), family TEXT NOT NULL, template TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT true, position INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS role_expansions (
+ id UUID PRIMARY KEY, anchor_role TEXT NOT NULL, expanded_role TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT true, position INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(anchor_role, expanded_role)
+);
+CREATE INDEX IF NOT EXISTS idx_role_expansions_anchor ON role_expansions(anchor_role, active, position);
 CREATE TABLE IF NOT EXISTS search_parameters (
  id UUID PRIMARY KEY, scrap_id UUID NOT NULL REFERENCES scraps(id) ON DELETE CASCADE, parameter_id TEXT NOT NULL, provider TEXT NOT NULL, query TEXT NOT NULL, url TEXT NOT NULL, family TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, category TEXT NOT NULL DEFAULT '', template_id UUID, variables JSONB NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending', completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(scrap_id, parameter_id)
 );
@@ -205,6 +209,19 @@ CREATE INDEX IF NOT EXISTS idx_premium_serp_user ON premium_serp_extractions(use
 CREATE INDEX IF NOT EXISTS idx_serp_sessions_expiry ON serp_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_url_occurrences_scrap ON url_occurrences(scrap_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_scrap ON jobs(scrap_id, updated_at);
+CREATE TABLE IF NOT EXISTS serp_lead_queue (
+ id UUID PRIMARY KEY,
+ scrap_id UUID NOT NULL REFERENCES scraps(id) ON DELETE CASCADE,
+ records JSONB NOT NULL DEFAULT '[]',
+ status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','processing','completed','failed')),
+ attempts INTEGER NOT NULL DEFAULT 0,
+ locked_at TIMESTAMPTZ,
+ error TEXT,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_serp_lead_queue_claim ON serp_lead_queue(status,created_at);
+CREATE INDEX IF NOT EXISTS idx_serp_lead_queue_scrap ON serp_lead_queue(scrap_id,created_at);
 CREATE INDEX IF NOT EXISTS idx_crawl_pages_scrap ON crawl_pages(scrap_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_evidence_scrap ON evidence(scrap_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_lead_sources_lead ON lead_sources(lead_id);
@@ -283,6 +300,10 @@ def init_db():
         conn.execute("ALTER TABLE sender_messages ADD CONSTRAINT sender_messages_status_check CHECK(status IN ('queued','sending','sent','failed','replied'))")
         conn.execute("ALTER TABLE leads DROP CONSTRAINT IF EXISTS leads_status_check")
         conn.execute("ALTER TABLE leads ADD CONSTRAINT leads_status_check CHECK(status IN ('working','completed'))")
+        conn.execute("ALTER TABLE leads ALTER COLUMN scrap_id DROP NOT NULL")
+        conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE CASCADE")
+        conn.execute("UPDATE leads l SET user_id=s.user_id FROM scraps s WHERE l.scrap_id=s.id AND l.user_id IS NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_user_status ON leads(user_id,status,created_at)")
         conn.execute("ALTER TABLE crawl_pages ADD COLUMN IF NOT EXISTS request_index INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE crawl_pages ADD COLUMN IF NOT EXISTS depth INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE crawl_pages ADD COLUMN IF NOT EXISTS occurrence_index INTEGER NOT NULL DEFAULT 0")
@@ -312,6 +333,10 @@ def init_db():
         conn.execute("UPDATE search_template_categories c SET stable_key='broad' WHERE c.id=(SELECT c2.id FROM search_template_categories c2 JOIN search_templates t ON t.category_id=c2.id WHERE t.family='broad' ORDER BY c2.created_at,c2.id LIMIT 1) AND c.stable_key IS NULL")
         conn.execute("DELETE FROM search_template_categories WHERE stable_key IS NULL AND name IN ('People','Contact','Company','Keyword','Broad')")
         conn.execute("INSERT INTO search_template_categories(id,name,stable_key,position) VALUES(gen_random_uuid(),'People','people',1),(gen_random_uuid(),'Contact','contact',2),(gen_random_uuid(),'Company','company',3),(gen_random_uuid(),'Keyword','keyword',4),(gen_random_uuid(),'Broad','broad',5) ON CONFLICT(stable_key) DO NOTHING")
+
+        conn.execute("""INSERT INTO role_expansions(id,anchor_role,expanded_role,position) VALUES
+        (gen_random_uuid(),'ceo','CEO',1),(gen_random_uuid(),'ceo','Chief Executive Officer',2),(gen_random_uuid(),'ceo','Chief Executive',3),(gen_random_uuid(),'ceo','Managing Director',4),(gen_random_uuid(),'ceo','President',5),(gen_random_uuid(),'ceo','Founder',6),(gen_random_uuid(),'ceo','Co-Founder',7),(gen_random_uuid(),'ceo','Executive Director',8)
+        ON CONFLICT(anchor_role,expanded_role) DO NOTHING""")
         conn.execute("INSERT INTO search_templates(id,category_id,provider,family,template,position) SELECT gen_random_uuid(),c.id,'google',x.family,x.template,x.position FROM (VALUES ('people','people','{product} {role} {geography-1} contact',1),('contact','contact','{product} {geography-1} email',2),('company','company','{product} {geography-1} company contact',3),('keyword','keyword-contact','{product} {keyword} {geography-1} contact',4),('broad','broad','{product} {geography-1}',5)) AS x(stable_key,family,template,position) JOIN search_template_categories c ON c.stable_key=x.stable_key WHERE NOT EXISTS (SELECT 1 FROM search_templates t WHERE t.category_id=c.id AND t.provider='google')")
         conn.execute("INSERT INTO search_templates(id,category_id,provider,family,template,position) SELECT gen_random_uuid(),c.id,'bing',x.family,x.template,x.position FROM (VALUES ('people','people','{product} {role} {geography-1} contact',1),('contact','contact','{product} {geography-1} email',2),('company','company','{product} {geography-1} company contact',3),('keyword','keyword-email','{product} {keyword} {geography-1} email',4),('broad','broad','{product} {geography-1}',5)) AS x(stable_key,family,template,position) JOIN search_template_categories c ON c.stable_key=x.stable_key WHERE NOT EXISTS (SELECT 1 FROM search_templates t WHERE t.category_id=c.id AND t.provider='bing')")
         conn.execute("ALTER TABLE scraps ADD COLUMN IF NOT EXISTS crawler_config JSONB NOT NULL DEFAULT '{}'::jsonb")
