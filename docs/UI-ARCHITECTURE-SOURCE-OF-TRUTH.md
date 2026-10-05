@@ -671,3 +671,7 @@ CTO clarified that every Search Template category must expose a delete icon, inc
 
 ### 7.3.18 Published family selector correction — 2026-10-03
 The Create/Edit Template editor exposes exactly one Family control: a native dropdown populated dynamically from active/published Template Family names in the database's category records, ordered by published position. The frontend contains no hardcoded family list, category-scoped suggestion logic, or Custom family free-text path.
+
+## Lead Workstation — Working / Completed Tabs (2026-10-05)
+
+The Lead Workstation MUST present exactly two lead-status tabs: **Working Leads** first/default and **Completed Leads** second. Working Leads remain the editable operational surface. Completed Leads are approved/locked records and are the only records eligible for workstation CSV/XLSX download. Existing sender/mobile access to completed Leads remains unchanged. This is a focused navigation/export change; it MUST NOT redesign the existing workstation visual system or alter Lead persistence, approval, extraction, enrichment, qualification, or sender semantics.
