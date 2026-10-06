@@ -1696,7 +1696,7 @@ def current_workstation(req: Request):
         current = conn.execute("SELECT id,name,status FROM scraps WHERE user_id=%s AND status IN ('active','running') ORDER BY created_at DESC LIMIT 1",(uid,)).fetchone()
         if not current: return None
         sid = current[0]
-        leads_rows = conn.execute("SELECT id,data,status,approved_at,approved_by,created_at FROM leads WHERE scrap_id=%s ORDER BY created_at,id",(sid,)).fetchall()
+        leads_rows = conn.execute("SELECT id,data,status,approved_at,approved_by,created_at FROM leads WHERE scrap_id=%s ORDER BY created_at DESC,id DESC",(sid,)).fetchall()
         source_counts = conn.execute("SELECT lead_id,count(*) FROM lead_sources WHERE lead_id = ANY(%s) GROUP BY lead_id",([row[0] for row in leads_rows],)).fetchall() if leads_rows else []
         balance = conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s",(uid,)).fetchone()[0]
         price = conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='scrap_creation_price_cents'").fetchone()[0]
@@ -1719,7 +1719,7 @@ def lead_workstation(scrap_id: str, req: Request):
         if not owned:
             raise HTTPException(404, "Scrap not found")
         rows = conn.execute(
-            "SELECT id,data,status,approved_at,approved_by,created_at FROM leads WHERE scrap_id=%s ORDER BY created_at,id",
+            "SELECT id,data,status,approved_at,approved_by,created_at FROM leads WHERE scrap_id=%s ORDER BY created_at DESC,id DESC",
             (sid,),
         ).fetchall()
         source_counts = conn.execute(
