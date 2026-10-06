@@ -475,13 +475,23 @@ class LeadDiscoveryPipeline:
                 if contact_name:
                     name_part = contact_name.group(1).strip()
                 else:
-                    # Generic title fallback; it is accepted only if the candidate words are not
-                    # recognizable page/category terms.
-                    name_part = title
-                    name_part = _re.sub(
-                        r"\s+(?:email\s*(?:&|and)\s*phone(?:\s+number)?|phone\s*(?:&|and)\s*email(?:\s+address)?|email\s+address)\b.*$",
-                        "", name_part, flags=_re.I,
-                    ).strip(" -|:")
+                    # Contact-directory pages frequently use the possessive form:
+                    # "Jane Doe's email & phone number". Keep this branch outside
+                    # the LinkedIn contract so LinkedIn parsing remains unchanged.
+                    possessive_contact = _re.match(
+                        r"^([A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+){1,3})['’]s\s+(?:email|phone)\b",
+                        title, _re.I,
+                    )
+                    if possessive_contact:
+                        name_part = possessive_contact.group(1).strip()
+                    else:
+                        # Generic title fallback; it is accepted only if the candidate words are not
+                        # recognizable page/category terms.
+                        name_part = title
+                        name_part = _re.sub(
+                            r"\s+(?:email\s*(?:&|and)\s*phone(?:\s+number)?|phone\s*(?:&|and)\s*email(?:\s+address)?|email\s+address)\b.*$",
+                            "", name_part, flags=_re.I,
+                        ).strip(" -|:")
 
         # Strip honorifics and professional credentials from the person-name portion.
         name_part = _re.sub(r"^(?:Dr\.?|Doctor|Prof\.?|Professor|Mr\.?|Mrs\.?|Ms\.?|Miss)\s+", "", name_part, flags=_re.I).strip()
