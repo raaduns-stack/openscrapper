@@ -484,6 +484,13 @@ class LeadDiscoveryPipeline:
                     )
                     if possessive_contact:
                         name_part = possessive_contact.group(1).strip()
+                        contact_tail = _re.search(r"(?:email|phone).*?(?:[-–—|])\s*(.+)$", title, _re.I)
+                        if contact_tail:
+                            descriptor = contact_tail.group(1).strip(" .")
+                            if _re.search(r"\b(?:CEO|chief|executive|president|director|founder|manager|officer|head|vice president|VP)\b", descriptor, _re.I):
+                                position = descriptor
+                            else:
+                                company_name = descriptor
                     else:
                         # Generic title fallback; it is accepted only if the candidate words are not
                         # recognizable page/category terms.
