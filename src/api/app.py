@@ -1080,32 +1080,25 @@ def admin_patch_search_template(template_id: str, request: dict, req: Request):
     if not _is_admin(user): raise HTTPException(403,"Admin access required")
     tid=uuid.UUID(template_id)
     with db() as conn:
-        row=conn.execute("SELECT category_id FROM search_templates WHERE id=%s",(tid,)).fetchone()
+        row=conn.execute("SELECT category_id,provider,family,template,active FROM search_templates WHERE id=%s",(tid,)).fetchone()
         if not row: raise HTTPException(404,"Search template not found")
+        category=conn.execute("SELECT name FROM search_template_categories WHERE id=%s AND active=true",(row[0],)).fetchone()
+        if not category: raise HTTPException(409,"Template category is not published")
+        provider=str(request.get("provider",row[1])).strip().lower()
+        family=str(request.get("family",row[2])).strip()
+        template=str(request.get("template",row[3])).strip()
+        if provider not in ("google","bing"): raise HTTPException(422,"Unsupported search provider")
+        if not family: raise HTTPException(422,"Family cannot be empty")
+        if family != category[0]: raise HTTPException(422,"Family must match a published template category")
+        if not template: raise HTTPException(422,"Template cannot be empty")
+        if any(v not in VARIABLES for v in __import__("re").findall(r"{([a-z0-9_-]+)}",template)): raise HTTPException(422,"Template contains an unsupported variable")
+        changed=(provider,family,template)!=(row[1],row[2],row[3])
+        if changed:
+            duplicate=conn.execute("SELECT 1 FROM search_templates WHERE category_id=%s AND provider=%s AND family=%s AND template=%s AND id<>%s LIMIT 1",(row[0],provider,family,template,tid)).fetchone()
+            if duplicate: raise HTTPException(409,"This template already exists in the selected category")
+        conn.execute("UPDATE search_templates SET provider=%s,family=%s,template=%s WHERE id=%s",(provider,family,template,tid))
         if "active" in request:
             conn.execute("UPDATE search_templates SET active=%s WHERE id=%s",(bool(request["active"]),tid))
-        if "provider" in request:
-            provider=str(request["provider"]).strip().lower()
-            if provider not in ("google","bing"): raise HTTPException(422,"Unsupported search provider")
-            current=conn.execute("SELECT category_id,family,template FROM search_templates WHERE id=%s",(tid,)).fetchone()
-            duplicate=conn.execute("SELECT 1 FROM search_templates WHERE category_id=%s AND provider=%s AND family=%s AND template=%s AND id<>%s LIMIT 1",(current[0],provider,current[1],current[2],tid)).fetchone()
-            if duplicate: raise HTTPException(409,"This template already exists in the selected category")
-            conn.execute("UPDATE search_templates SET provider=%s WHERE id=%s",(provider,tid))
-        if "family" in request:
-            family=str(request["family"]).strip()
-            if not family: raise HTTPException(422,"Family cannot be empty")
-            current=conn.execute("SELECT category_id,provider,template FROM search_templates WHERE id=%s",(tid,)).fetchone()
-            category=conn.execute("SELECT name FROM search_template_categories WHERE id=%s AND active=true",(current[0],)).fetchone()
-            if not category: raise HTTPException(409,"Template category is not published")
-            if family != category[0]: raise HTTPException(422,"Family must match a published template category")
-            duplicate=conn.execute("SELECT 1 FROM search_templates WHERE category_id=%s AND provider=%s AND family=%s AND template=%s AND id<>%s LIMIT 1",(current[0],current[1],family,current[2],tid)).fetchone()
-            if duplicate: raise HTTPException(409,"This template already exists in the selected category")
-            conn.execute("UPDATE search_templates SET family=%s WHERE id=%s",(family,tid))
-        if "template" in request:
-            template=str(request["template"]).strip()
-            if not template: raise HTTPException(422,"Template cannot be empty")
-            if any(v not in VARIABLES for v in __import__("re").findall(r"{([a-z0-9_-]+)}",template)): raise HTTPException(422,"Template contains an unsupported variable")
-            conn.execute("UPDATE search_templates SET template=%s WHERE id=%s",(template,tid))
         if "position" in request:
             target=max(0,int(request["position"]))
             ids=[r[0] for r in conn.execute("SELECT id FROM search_templates WHERE category_id=%s ORDER BY position,created_at",(row[0],)).fetchall()]
