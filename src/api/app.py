@@ -21,7 +21,6 @@ from src.agent.query_interpreter import QueryInterpreter
 from src.agent.geography import GeographyResolver
 from src.dedupe.leads import persist_lead, dedupe, exclude_existing
 from src.observability.job_events import JobEventSink, emit_event
-from src.search.strategy import SearchStrategyEngine
 from src.search.template_engine import SearchTemplateEngine, VARIABLES
 from src.search.premium import HttpPremiumSerpProvider, parse_search_url, SUPPORTED_PROVIDERS, provider_statuses, save_provider_config
 from src.db import db, init_db, purge_expired_history, get_client_policies
@@ -763,8 +762,8 @@ def create_scrap(request: ScrapRequest, req: Request):
         timeout_hours=int(conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_timeout_hours'").fetchone()[0])
         criteria=dict(request.criteria or {})
         scrap_name=derive_scrap_name(criteria, request.name)
-        requested_max_leads=int(criteria.get("max_leads", default_max_leads))
-        if requested_max_leads < 1 or requested_max_leads > max_leads_limit: raise HTTPException(422, f"Maximum leads must be between 1 and {max_leads_limit}")
+        requested_max_leads=default_max_leads
+        if requested_max_leads < 1 or requested_max_leads > max_leads_limit: raise HTTPException(422, f"Configured default maximum leads must be between 1 and {max_leads_limit}")
         criteria["max_leads"]=requested_max_leads
         crawler_data=request.crawler.model_dump(); crawler_data["max_duration_hours"]=timeout_hours
         wallet=conn.execute("SELECT balance_cents FROM wallets WHERE user_id=%s FOR UPDATE",(uid,)).fetchone()
@@ -1947,7 +1946,7 @@ class JobRequest(BaseModel):
         return self
 
 class SearchParameterRequest(BaseModel):
-    criteria: SearchCriteria
+    criteria: dict = Field(default_factory=dict)
     max_queries: int=Field(default=0, ge=0)
     scrap_id: str|None=None
 
@@ -2295,7 +2294,7 @@ def generate_scrap_export(scrap_id: str, fmt: str, req: Request):
     with db() as conn:
         owned=conn.execute("SELECT 1 FROM scraps WHERE id=%s AND user_id=%s", (sid, uuid.UUID(user["id"]))).fetchone()
         if not owned: raise HTTPException(404, "Scrap not found")
-        rows=conn.execute("SELECT data FROM leads WHERE scrap_id=%s ORDER BY created_at,id", (sid,)).fetchall()
+        rows=conn.execute("SELECT data FROM leads WHERE scrap_id=%s AND status='completed' ORDER BY created_at,id", (sid,)).fetchall()
     leads=[Lead.model_construct(**(row[0] or {})) for row in rows]
     export_id=uuid.uuid4()
     output=_write_export(leads, export_id.hex, fmt)
@@ -2311,8 +2310,17 @@ def search_parameters(request: SearchParameterRequest, req: Request):
     with db() as conn:
         from src.search.provider_google import GoogleQueryAdapter
         from src.search.provider_bing import BingQueryAdapter
+        criteria=dict(request.criteria or {})
+        if request.scrap_id:
+            owned=conn.execute("SELECT criteria FROM scraps WHERE id=%s AND user_id=%s",(uuid.UUID(request.scrap_id),uuid.UUID(user["id"]))).fetchone()
+            if not owned: raise HTTPException(404,"Scrap not found")
+            criteria=dict(owned[0] or {})
+        else:
+            admin_max_leads=int(conn.execute("SELECT (value #>> '{}')::bigint FROM app_settings WHERE key='research_default_max_leads'").fetchone()[0])
+            criteria["max_leads"]=admin_max_leads
+        criteria=SearchCriteria.model_validate(criteria)
         engine=SearchTemplateEngine(conn, {"google":GoogleQueryAdapter(), "bing":BingQueryAdapter()})
-        params=engine.generate(request.criteria,request.max_queries)
+        params=engine.generate(criteria,request.max_queries)
         if request.scrap_id:
             owned=conn.execute("SELECT 1 FROM scraps WHERE id=%s AND user_id=%s",(uuid.UUID(request.scrap_id),uuid.UUID(user["id"]))).fetchone()
             if not owned: raise HTTPException(404,"Scrap not found")

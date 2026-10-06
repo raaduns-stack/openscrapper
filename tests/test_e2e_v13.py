@@ -9,7 +9,27 @@ from src.models.criteria import CrawlerConfig, SearchCriteria
 from src.models.lead import Lead
 from src.pipeline import LeadDiscoveryPipeline
 from src.search.serp_extractor import extract_destination_urls
-from src.search.strategy import SearchStrategyEngine
+from src.search.template_engine import SearchTemplateEngine
+
+
+class _TemplateCursor:
+    def __init__(self, rows): self.rows=rows
+    def fetchall(self): return self.rows
+
+class _TemplateConn:
+    def execute(self, sql, params=()):
+        sql=' '.join(sql.split())
+        if sql.startswith('SELECT expanded_role FROM role_expansions'):
+            return _TemplateCursor([])
+        if sql.startswith('SELECT t.id,t.category_id'):
+            return _TemplateCursor([
+                ('google-id','c1','google','{role} {geography-1} contact','people','Contact'),
+                ('bing-id','c1','bing','{role} {geography-1} contact','people','Contact'),
+            ])
+        raise AssertionError(sql)
+
+class _TemplateAdapter:
+    def build_url(self, query): return 'https://example.test/?q=' + query.replace(' ','+')
 
 
 class FakeCollector:
@@ -54,13 +74,13 @@ def test_v13_serp_challenge_stops_import():
     assert extract_destination_urls("<html>captcha verify you are human</html>", "https://www.google.com/sorry/index") == []
 
 
-def test_v13_search_strategy_generates_google_and_bing_parameters():
-    criteria = SearchCriteria(industry="gold", product="gold", geography="India", roles=["buyer"], max_leads=20)
-    params = SearchStrategyEngine().generate(criteria, max_queries=20)
-    assert params and {p.provider for p in params} == {"google", "bing"}
-    assert any("email" in p.query.lower() for p in params)
-    assert any("linkedin.com/in" in p.query.lower() for p in params)
-
+def test_v13_admin_templates_generate_google_and_bing_parameters():
+    criteria = SearchCriteria(industry='gold', product='gold', geography='India', roles=['buyer'], max_leads=20)
+    engine = SearchTemplateEngine(_TemplateConn(), {'google': _TemplateAdapter(), 'bing': _TemplateAdapter()})
+    params = engine.generate(criteria, max_queries=20)
+    assert params and [p.provider for p in params] == ['google', 'bing']
+    assert [p.query for p in params] == ['buyer India contact', 'buyer India contact']
+    assert all(p.category == 'Contact' and p.family == 'people' for p in params)
 
 def test_v13_url_import_api_rejects_google_sheets_without_target():
     from src.api.app import UrlImportRequest

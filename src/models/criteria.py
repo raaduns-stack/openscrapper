@@ -18,13 +18,13 @@ class CrawlerConfig(BaseModel):
 
 
 class SearchCriteria(BaseModel):
-    industry: str = Field(min_length=1)
+    industry: str | None = None
     product: str | None = None
     geography: str | None = None
     target_type: Literal["people", "companies", "both"] = "people"
     roles: list[str] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
-    max_leads: int = Field(default=100, ge=1, le=10000)
+    max_leads: int = Field(ge=1, le=10000)
 
     @field_validator("industry", "product", "geography", mode="before")
     @classmethod
