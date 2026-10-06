@@ -1,7 +1,7 @@
 # Scrappee Browser Extension — Source of Truth
 
 **Status:** APPROVED / CANONICAL
-**Version:** 0.6.14
+**Version:** 0.6.15
 **Date:** 2026-10-01
 
 ## Purpose
@@ -58,6 +58,13 @@ The extension workflow is intentionally simple and must not be redesigned withou
 - Duplicate results/pages must not be introduced solely because the popup was reopened.
 - The extension displays the current captured count.
 - The user can clear captured results explicitly with **CLEAR CAPTURED RESULTS**.
+
+### Automatic SERP collection — APPROVED CURRENT BEHAVIOR
+
+- The service worker may automatically collect successive Google/Bing SERP pages after the user starts automatic collection.
+- Automatic collection uses the same authenticated Current Scrap and `/serp/import` handoff.
+- Automatic collection must preserve the same server-side persistence and duplicate protection as explicit Sync.
+- Automatic collection must not alter the locked authentication, capture, or Current Scrap workflow.
 
 ## Scrappee handoff — LOCKED
 

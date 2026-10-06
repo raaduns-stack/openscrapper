@@ -77,9 +77,9 @@ def test_serp_import_persists_results_and_duplicate_occurrences():
     token=client.post('/serp/sessions',headers=headers,json={'scrap_id':scrap}).json()['token']
     item={'url':'https://example.com/contact','title':'Contact','snippet':'Email person@example.com','provider':'google','page_url':'https://www.google.com/search?q=contact'}
     response=client.post('/serp/import',headers=headers,json={'token':token,'results':[item,item]})
-    assert response.status_code==200 and response.json()['results']==2
+    assert response.status_code==200 and response.json()['results']==2 and response.json()['new_results']==1
     live=client.get(f'/scraps/{scrap}',headers=headers).json()
-    assert live['counts']['serp_results']==2 and live['counts']['url_occurrences']==2
+    assert live['counts']['serp_results']==1 and live['counts']['url_occurrences']==1
 
 
 def test_serp_session_cannot_be_imported_without_owner_auth():

@@ -205,6 +205,7 @@ CREATE INDEX IF NOT EXISTS idx_domain_rules_user ON domain_rules(user_id, domain
 CREATE INDEX IF NOT EXISTS idx_search_parameters_scrap ON search_parameters(scrap_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_search_parameters_queue ON search_parameters(scrap_id, category, status, position);
 CREATE INDEX IF NOT EXISTS idx_serp_results_scrap ON serp_results(scrap_id, captured_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_serp_results_scrap_url_unique ON serp_results(scrap_id, url);
 CREATE INDEX IF NOT EXISTS idx_premium_serp_user ON premium_serp_extractions(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_serp_sessions_expiry ON serp_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_url_occurrences_scrap ON url_occurrences(scrap_id, created_at);

@@ -2424,8 +2424,9 @@ def import_serp_urls(request: SerpImportRequest, req: Request):
                 duplicate=conn.execute("SELECT 1 FROM serp_results WHERE scrap_id=%s AND url=%s LIMIT 1",(scrap_id,item["url"])).fetchone()
                 if duplicate: continue
                 if used + added >= limit: raise HTTPException(409,f"SERP result limit reached: {used}/{limit}; import rejected")
-                rid=uuid.uuid4(); conn.execute("INSERT INTO serp_results(id,scrap_id,url,title,snippet,raw_text,provider,page_url) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",(rid,scrap_id,item["url"],item.get("title","")[:1000],item.get("snippet","")[:5000],item.get("raw_text","")[:10000],item.get("provider"),item.get("page_url")))
-                conn.execute("INSERT INTO url_occurrences(id,scrap_id,url,serp_result_id) VALUES(%s,%s,%s,%s)",(uuid.uuid4(),scrap_id,item["url"],rid)); added+=1; new_results.append(item)
+                rid=uuid.uuid4(); inserted=conn.execute("INSERT INTO serp_results(id,scrap_id,url,title,snippet,raw_text,provider,page_url) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (scrap_id,url) DO NOTHING RETURNING id",(rid,scrap_id,item["url"],item.get("title","")[:1000],item.get("snippet","")[:5000],item.get("raw_text","")[:10000],item.get("provider"),item.get("page_url"))).fetchone()
+                if not inserted: continue
+                conn.execute("INSERT INTO url_occurrences(id,scrap_id,url,serp_result_id) VALUES(%s,%s,%s,%s)",(uuid.uuid4(),scrap_id,item["url"],inserted[0])); added+=1; new_results.append(item)
         conn.execute("UPDATE serp_sessions SET urls=%s,results=%s,imports=%s WHERE token=%s",(Jsonb(session["urls"]),Jsonb(session["results"]),Jsonb(session["imports"]),request.token))
         conn.commit()
     if new_results and session.get("scrap_id"):
